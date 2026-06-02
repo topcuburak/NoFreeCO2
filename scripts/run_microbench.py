@@ -42,7 +42,7 @@ def main() -> None:
     print(f"[microbench] nvme_write target dir: {scratch}")
     nbytes = int(args.bytes)
 
-    tele = build_telemetry(cfg)
+    tele = build_telemetry(cfg, nvml_gpus=[args.gpu])   # scope GPU power to the one in use
     tele.start()
     try:
         benches = [

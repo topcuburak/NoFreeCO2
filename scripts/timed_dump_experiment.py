@@ -75,6 +75,25 @@ def gpu_compute_pids() -> list[int]:
     return sorted(pids)
 
 
+def pid_gpu_indices(pids) -> list[int] | None:
+    """NVML indices of the GPU(s) the given PIDs run on -- to scope power to just
+    the GPU(s) involved (clean attribution for TP=1)."""
+    if not _HAVE_NVML:
+        return None
+    want = {int(p) for p in pids}
+    idx = set()
+    try:
+        pynvml.nvmlInit()
+        for i in range(pynvml.nvmlDeviceGetCount()):
+            h = pynvml.nvmlDeviceGetHandleByIndex(i)
+            for p in pynvml.nvmlDeviceGetComputeRunningProcesses(h):
+                if int(p.pid) in want:
+                    idx.add(i)
+    except Exception:
+        return None
+    return sorted(idx) or None
+
+
 def dump_and_resume(tele, cc_bin, criu_bin, pids, out_dir, mark_min, baseline, keep_images,
                     multiproc=False, criu_root=None, hold_seconds=0.0, skip_criu=False,
                     store=False, store_out=None):
@@ -219,7 +238,7 @@ def main() -> None:
     print(f"[timed] target GPU PIDs: {pids}")
     print(f"[timed] marks (min): {marks}")
 
-    tele = build_telemetry()
+    tele = build_telemetry(nvml_gpus=pid_gpu_indices(pids))   # scope GPU power to vLLM's GPU(s)
     tele.start()
     t0 = time.monotonic()
     try:

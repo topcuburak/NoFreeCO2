@@ -12,11 +12,12 @@ from harness.configload import load  # noqa: E402
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
 
 
-def build_telemetry(cfg: dict | None = None) -> Telemetry:
+def build_telemetry(cfg: dict | None = None, nvml_gpus: list[int] | None = None) -> Telemetry:
     cfg = cfg or load("ford.yaml")
     hz = cfg.get("telemetry", {}).get("power_sample_hz", 20)
-    tele = Telemetry(default_sources(cfg), sample_hz=hz)
-    print(f"[telemetry] {tele.summary()}")
+    tele = Telemetry(default_sources(cfg, nvml_gpus=nvml_gpus), sample_hz=hz)
+    scope = f"GPU{nvml_gpus}" if nvml_gpus is not None else "all GPUs"
+    print(f"[telemetry] {tele.summary()}  (nvml scope: {scope})")
     return tele
 
 

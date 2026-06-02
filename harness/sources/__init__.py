@@ -13,11 +13,12 @@ __all__ = [
 ]
 
 
-def default_sources(cfg: dict) -> list[Source]:
-    """Build the source set declared in ford.yaml, skipping unavailable ones."""
+def default_sources(cfg: dict, nvml_gpus: list[int] | None = None) -> list[Source]:
+    """Build the source set declared in ford.yaml, skipping unavailable ones.
+    nvml_gpus: scope GPU power to these NVML indices (None = all GPUs summed)."""
     want = cfg.get("telemetry", {}).get("sources", {})
     candidates: list[Source] = []
-    if want.get("nvml"):       candidates.append(NvmlSource())
+    if want.get("nvml"):       candidates.append(NvmlSource(gpu_indices=nvml_gpus))
     if want.get("rapl", True): candidates.append(RaplSource())      # AMD CPU pkg energy
     if want.get("perf_pkg"):   candidates.append(PerfPkgSource())   # amd_energy hwmon fallback
     if want.get("ipmi"):       candidates.append(IpmiSource())

@@ -61,7 +61,7 @@ def main() -> None:
     cfg = load("ford.yaml")
     dirs = [("hbm_to_host", pcie_copy), ("host_to_hbm", pcie_copy_h2d)]
 
-    tele = build_telemetry(cfg)
+    tele = build_telemetry(cfg, nvml_gpus=[args.gpu])   # scope GPU power to the one in use
     tele.start()
     rows = []
     try:
