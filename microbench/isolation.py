@@ -56,6 +56,26 @@ def pcie_copy_h2d(nbytes: int, gpu: int = 0, iters: int = 50) -> int:
     return nbytes * iters
 
 
+def dd_write(path: str, nbytes: int, bs: int = 1 << 26) -> int:
+    """O_DIRECT durable write (host->NVMe). Returns bytes written. Device-rate proxy
+    for the checkpoint STORE leg (writes zeros; same write-side I/O cost)."""
+    import subprocess
+    count = nbytes // bs
+    subprocess.run(["dd", "if=/dev/zero", f"of={path}", f"bs={bs}", f"count={count}",
+                    "oflag=direct", "conv=fdatasync"], check=True, capture_output=True)
+    return count * bs
+
+
+def dd_read(path: str, nbytes: int, bs: int = 1 << 26) -> int:
+    """O_DIRECT read (NVMe->host). Returns bytes read. Device-rate proxy for the
+    checkpoint LOAD leg (drop caches first for a cold/device read)."""
+    import subprocess
+    count = nbytes // bs
+    subprocess.run(["dd", f"if={path}", "of=/dev/null", f"bs={bs}", f"count={count}",
+                    "iflag=direct"], check=True, capture_output=True)
+    return count * bs
+
+
 def nvme_read(path: str, nbytes: int, iters: int = 1) -> int:
     """host <- NVMe: read nbytes from an existing file. For a true device read,
     drop page cache first (the characterize script does `echo 3 > drop_caches`).

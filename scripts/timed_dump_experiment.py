@@ -40,7 +40,17 @@ sys.path.insert(0, _REPO)                                   # for harness/_commo
 
 import transparent_dump as td                               # noqa: E402  (reuse ops)
 from harness import measure_operation                       # noqa: E402
+from microbench.isolation import dd_write, dd_read          # noqa: E402
 from _common import build_telemetry, write_record, print_record  # noqa: E402
+
+
+def drop_caches() -> None:
+    os.system("sync")
+    try:
+        with open("/proc/sys/vm/drop_caches", "w") as f:
+            f.write("3\n")
+    except OSError:
+        pass
 
 try:
     import pynvml                                            # noqa: E402
@@ -66,12 +76,14 @@ def gpu_compute_pids() -> list[int]:
 
 
 def dump_and_resume(tele, cc_bin, criu_bin, pids, out_dir, mark_min, baseline, keep_images,
-                    multiproc=False, criu_root=None, hold_seconds=0.0, skip_criu=False):
-    """One suspend->[dump]->resume cycle, measured records tagged by mark.
+                    multiproc=False, criu_root=None, hold_seconds=0.0, skip_criu=False,
+                    store=False, store_out=None):
+    """One full cycle, measured records tagged by mark:
+    suspend (HBM->host) -> [store (host->NVMe)] -> [hold] -> [load (NVMe->host)] -> resume.
 
-    skip_criu: skip the host criu_dump phase (it's blocked by io_uring on stock
-    criu) and measure only the cuda-checkpoint footprint + resume. The store cost
-    then comes from the storage characterization, not a live criu image.
+    skip_criu: skip the criu image write (blocked by io_uring on stock criu).
+    store: add a footprint-sized O_DIRECT write (store) + cold read (load) to/from
+    store_out as a device-rate proxy for the disk persist/restore leg.
     """
     gpu_before = td.gpu_used_bytes()
     mark_dir = os.path.join(out_dir, f"mark_{mark_min}min")
@@ -100,6 +112,18 @@ def dump_and_resume(tele, cc_bin, criu_bin, pids, out_dir, mark_min, baseline, k
         if not keep_images:
             shutil.rmtree(mark_dir, ignore_errors=True)
 
+    # phase 2b: STORE (host DRAM -> NVMe) -- footprint-sized O_DIRECT proxy write
+    rec_store = None
+    spath = None
+    if store:
+        os.makedirs(store_out, exist_ok=True)
+        spath = os.path.join(store_out, f"socc_store_{mark_min}min.bin")
+        rec_store = measure_operation(
+            tele, workload="timed_dump", operation="store",
+            state_bytes=gpu_before, baseline_seconds=baseline,
+            op=lambda: dd_write(spath, gpu_before),
+            config={"mark_min": mark_min, "domain": "host", "phase": "store", "out": store_out})
+
     # optional hold: observe the checkpointed state (nvidia-smi shows GPU freed;
     # image at mark_dir if --keep-images) and capture idle-holding power E_idle.
     if hold_seconds > 0:
@@ -116,6 +140,20 @@ def dump_and_resume(tele, cc_bin, criu_bin, pids, out_dir, mark_min, baseline, k
         rec_h.extra["mark_min"] = mark_min
         write_record(rec_h, "timed_dump")
 
+    # phase 3b: LOAD (NVMe -> host DRAM) -- cold read back before resume
+    rec_load = None
+    if store:
+        drop_caches()
+        rec_load = measure_operation(
+            tele, workload="timed_dump", operation="load",
+            state_bytes=gpu_before, baseline_seconds=baseline,
+            op=lambda: dd_read(spath, gpu_before),
+            config={"mark_min": mark_min, "domain": "host", "phase": "load"})
+        try:
+            os.remove(spath)
+        except OSError:
+            pass
+
     # phase 3: resume (host -> HBM), resumes inference
     rec_r = measure_operation(
         tele, workload="timed_dump", operation="cuda_restore",
@@ -124,17 +162,18 @@ def dump_and_resume(tele, cc_bin, criu_bin, pids, out_dir, mark_min, baseline, k
         config={"mark_min": mark_min, "domain": "accelerator", "phase": "resume",
                 "multiproc": multiproc})
 
-    recs = [rec_s] + ([rec_c] if rec_c else []) + [rec_r]
+    recs = ([rec_s] + ([rec_c] if rec_c else []) + ([rec_store] if rec_store else [])
+            + ([rec_load] if rec_load else []) + [rec_r])
     for r in recs:
         r.extra["mark_min"] = mark_min
         print_record(r)
         write_record(r, "timed_dump")
     footprint_gb = rec_s.extra.get("gpu_freed_bytes", 0) / 1e9
-    dump_s = rec_c.latency_s if rec_c else 0.0
-    paused = rec_s.latency_s + dump_s + rec_r.latency_s
+    store_s = rec_store.latency_s if rec_store else (rec_c.latency_s if rec_c else 0.0)
+    load_s = rec_load.latency_s if rec_load else 0.0
     print(f"[timed] mark {mark_min}min: FOOTPRINT {footprint_gb:.1f} GB | "
-          f"suspend {rec_s.latency_s:.2f}s + dump {dump_s:.2f}s + resume {rec_r.latency_s:.2f}s "
-          f"| serving paused ~{paused:.1f}s")
+          f"suspend {rec_s.latency_s:.2f}s + store {store_s:.2f}s + load {load_s:.2f}s + "
+          f"resume {rec_r.latency_s:.2f}s")
     return rec_s, rec_c, rec_r
 
 
@@ -159,6 +198,11 @@ def main() -> None:
     ap.add_argument("--skip-criu", action="store_true",
                     help="skip the host criu_dump phase (blocked by io_uring on ford); "
                          "measure cuda-checkpoint footprint + resume only")
+    ap.add_argument("--store", action="store_true",
+                    help="add store(host->NVMe)+load(NVMe->host) of the footprint between "
+                         "suspend and resume (device-rate O_DIRECT proxy for the disk persist)")
+    ap.add_argument("--store-out", default="/var/data",
+                    help="dir for the store proxy file (put on the tier you want, e.g. /var/data)")
     args = ap.parse_args()
 
     pf = td.preflight(args)
@@ -190,7 +234,8 @@ def main() -> None:
                 dump_and_resume(tele, pf["cuda_checkpoint"], pf["criu"], cur,
                                 args.out, m, args.baseline, args.keep_images,
                                 multiproc=args.multiproc, criu_root=args.criu_root,
-                                hold_seconds=args.hold_seconds, skip_criu=args.skip_criu)
+                                hold_seconds=args.hold_seconds, skip_criu=args.skip_criu,
+                                store=args.store, store_out=args.store_out)
             except Exception as e:
                 print(f"[timed] mark {m}min FAILED: {type(e).__name__}: {e}")
                 print(f"[timed] (if criu errored, paste it -- likely needs extra flags)")
