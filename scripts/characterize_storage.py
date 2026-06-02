@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import subprocess
 import sys
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -41,13 +42,38 @@ def drop_caches() -> None:
         print(f"[storage] WARN: can't drop caches ({e}); reads may hit page cache")
 
 
+_BS = 1 << 26  # 64 MB, block-aligned for O_DIRECT
+
+
+def dd_write(path: str, nbytes: int) -> int:
+    """O_DIRECT durable write -> measures DEVICE write bandwidth (bypasses page cache)."""
+    count = nbytes // _BS
+    subprocess.run(["dd", "if=/dev/zero", f"of={path}", f"bs={_BS}", f"count={count}",
+                    "oflag=direct", "conv=fdatasync"], check=True, capture_output=True)
+    return count * _BS
+
+
+def dd_read(path: str, nbytes: int) -> int:
+    """O_DIRECT read -> measures DEVICE read bandwidth (bypasses page cache)."""
+    count = nbytes // _BS
+    subprocess.run(["dd", f"if={path}", "of=/dev/null", f"bs={_BS}", f"count={count}",
+                    "iflag=direct"], check=True, capture_output=True)
+    return count * _BS
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="storage-tier write/read latency + energy")
     ap.add_argument("--bytes", type=float, default=16e9, help="bytes per write/read")
     ap.add_argument("--tiers", default=None,
                     help="name=dir,name=dir (default: ford.yaml storage.tiers)")
     ap.add_argument("--baseline", type=float, default=5.0)
+    ap.add_argument("--method", choices=["direct", "buffered"], default="direct",
+                    help="direct = O_DIRECT dd (DEVICE capability); "
+                         "buffered = Python page-cache write+fsync (realistic checkpoint)")
     args = ap.parse_args()
+
+    write_op = dd_write if args.method == "direct" else (lambda p, n: nvme_write(n, p, iters=1))
+    read_op = dd_read if args.method == "direct" else nvme_read
 
     cfg = load("ford.yaml")
     if args.tiers:
@@ -71,16 +97,16 @@ def main() -> None:
             rec_w = measure_operation(
                 tele, workload=f"storage:{name}", operation="write",
                 state_bytes=nbytes, baseline_seconds=args.baseline,
-                op=lambda p=path: nvme_write(nbytes, p, iters=1),
-                config={"tier": name, "dir": d})
+                op=lambda p=path: write_op(p, nbytes),
+                config={"tier": name, "dir": d, "method": args.method})
             print_record(rec_w); write_record(rec_w, "storage_char")
 
             drop_caches()
             rec_r = measure_operation(
                 tele, workload=f"storage:{name}", operation="read",
                 state_bytes=nbytes, baseline_seconds=args.baseline,
-                op=lambda p=path: nvme_read(p, nbytes),
-                config={"tier": name, "dir": d})
+                op=lambda p=path: read_op(p, nbytes),
+                config={"tier": name, "dir": d, "method": args.method})
             print_record(rec_r); write_record(rec_r, "storage_char")
 
             try:

@@ -68,6 +68,7 @@ def nvme_write(nbytes: int, path: str, iters: int = 10) -> int:
     """host DRAM -> NVMe. O_DIRECT-ish: flush + fsync to defeat page cache."""
     import os
     buf = bytearray(os.urandom(min(nbytes, 1 << 26)))  # <=64MB pattern, repeated
+    mv = memoryview(buf)                                # avoid per-chunk slice copies
     written = 0
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
     try:
@@ -75,10 +76,10 @@ def nvme_write(nbytes: int, path: str, iters: int = 10) -> int:
             remaining = nbytes
             os.lseek(fd, 0, os.SEEK_SET)
             while remaining > 0:
-                chunk = buf[: min(len(buf), remaining)]
-                os.write(fd, chunk)
-                remaining -= len(chunk)
-                written += len(chunk)
+                n = min(len(buf), remaining)
+                os.write(fd, mv[:n])
+                remaining -= n
+                written += n
             os.fsync(fd)
     finally:
         os.close(fd)
