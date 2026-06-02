@@ -120,16 +120,30 @@ def main() -> None:
     def bw(rec):  # GB/s
         return nbytes / rec.latency_s / 1e9 if rec.latency_s else 0.0
 
-    def pjb(rec):  # pJ/bit from marginal energy
-        return rec.total_energy_j / (nbytes * 8) * 1e12 if rec.total_energy_j else 0.0
+    def cpu_marg(rec):  # CPU energy above idle (data-movement cost)
+        for s in rec.sources:
+            if s.name == "cpu_pkg_energy_rapl":
+                return s.energy_j or 0.0
+        return 0.0
 
-    print("\n=== STORAGE TIER CHARACTERIZATION "
-          f"({nbytes/1e9:.0f} GB) ===")
-    print(f"{'tier':14}{'op':7}{'GB/s':>8}{'latency_s':>11}{'marginal_J':>12}{'pJ/bit':>11}")
+    def cpu_abs(rec):  # CPU energy incl. idle = data-movement + TIME TERM (dominant)
+        for s in rec.sources:
+            if s.name == "cpu_pkg_energy_rapl" and s.energy_abs_j is not None:
+                return s.energy_abs_j
+        return 0.0
+
+    def pjb_abs(rec):  # pJ/bit from the time-term-inclusive CPU energy
+        return cpu_abs(rec) / (nbytes * 8) * 1e12 if cpu_abs(rec) else 0.0
+
+    print(f"\n=== STORAGE TIER CHARACTERIZATION ({nbytes/1e9:.0f} GB, method={args.method}) ===")
+    print("  cpu_marg = CPU energy above idle (move only) | cpu_abs = incl. idle "
+          "(move + time term, the real dump cost)")
+    print(f"{'tier':14}{'op':7}{'GB/s':>8}{'latency_s':>11}{'cpu_marg_J':>12}"
+          f"{'cpu_abs_J':>12}{'pJ/bit(abs)':>13}")
     for name, rw, rr in rows:
         for op, rec in (("write", rw), ("read", rr)):
             print(f"{name:14}{op:7}{bw(rec):8.2f}{rec.latency_s:11.2f}"
-                  f"{rec.total_energy_j:12.1f}{pjb(rec):11.1f}")
+                  f"{cpu_marg(rec):12.1f}{cpu_abs(rec):12.1f}{pjb_abs(rec):13.1f}")
 
 
 if __name__ == "__main__":
