@@ -1,0 +1,159 @@
+#!/usr/bin/env python3
+"""Timed transparent-dump experiment: while a vLLM serving run is live, perform a
+suspend -> dump -> resume at fixed wall-clock marks (e.g. 10,20,30,40,50 min) and
+measure the cost of each, tagged by mark.
+
+Per mark, the cycle (serving continues between marks):
+  1. cuda-checkpoint --toggle   running -> checkpointed   (HBM->host)   [accelerator]
+  2. criu dump --leave-running  process image -> NVMe                   [host]
+  3. cuda-checkpoint --toggle   checkpointed -> running   (host->HBM)   [accelerator]
+
+Records 3 measured RunRecords per mark -> data/timed_dump.jsonl.
+
+ATTACH MODEL (clean privilege split):
+  terminal 1 (you):   launch serving as yourself, single checkpointable process:
+      VLLM_ENABLE_V1_MULTIPROCESSING=0 python workloads/a2_vllm/serve.py \
+          --model meta-llama/Llama-3.1-8B --tensor-parallel-size 1 \
+          --dataset data/lbv2_40k_90k.jsonl --prompt-field prompt --repeat 12 ...
+  terminal 2 (root):  once it's at steady state, start the clock:
+      sudo -E $(which python) scripts/timed_dump_experiment.py \
+          --marks-min 10,20,30,40,50 --out /mnt/md0/tdump
+
+PIDs to checkpoint are auto-detected from NVML (processes using the GPU); override
+with --pids. Marks are relative to THIS controller's start (t0). Images are deleted
+after measuring unless --keep-images (resume uses cuda-checkpoint, not the image).
+
+TP=4 is the hard case (NCCL + multiple procs); prove TP=1 first, then model TP=4.
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import shutil
+import sys
+import time
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _HERE)                                   # for transparent_dump
+sys.path.insert(0, os.path.dirname(_HERE))                  # for harness/_common
+
+import transparent_dump as td                               # noqa: E402  (reuse ops)
+from harness import measure_operation                       # noqa: E402
+from _common import build_telemetry, write_record, print_record  # noqa: E402
+
+try:
+    import pynvml                                            # noqa: E402
+    _HAVE_NVML = True
+except Exception:
+    _HAVE_NVML = False
+
+
+def gpu_compute_pids() -> list[int]:
+    """PIDs currently holding a CUDA context on any GPU (the ones to checkpoint)."""
+    if not _HAVE_NVML:
+        return []
+    pids: set[int] = set()
+    try:
+        pynvml.nvmlInit()
+        for i in range(pynvml.nvmlDeviceGetCount()):
+            h = pynvml.nvmlDeviceGetHandleByIndex(i)
+            for p in pynvml.nvmlDeviceGetComputeRunningProcesses(h):
+                pids.add(int(p.pid))
+    except Exception:
+        pass
+    return sorted(pids)
+
+
+def dump_and_resume(tele, cc_bin, criu_bin, pids, out_dir, mark_min, baseline, keep_images):
+    """One suspend->dump->resume cycle, 3 measured records, tagged by mark."""
+    gpu_before = td.gpu_used_bytes()
+    mark_dir = os.path.join(out_dir, f"mark_{mark_min}min")
+
+    # phase 1: suspend (HBM -> host), pauses inference
+    rec_s = measure_operation(
+        tele, workload="timed_dump", operation="cuda_checkpoint",
+        state_bytes=gpu_before, baseline_seconds=baseline,
+        op=lambda: td.op_cuda_checkpoint(cc_bin, pids),
+        config={"mark_min": mark_min, "domain": "accelerator", "phase": "suspend"})
+    gpu_after = td.gpu_used_bytes()
+    rec_s.extra["gpu_freed_bytes"] = gpu_before - gpu_after
+
+    # phase 2: persist (host -> NVMe)
+    rss = td.rss_bytes(pids)
+    rec_c = measure_operation(
+        tele, workload="timed_dump", operation="criu_dump",
+        state_bytes=rss, baseline_seconds=baseline,
+        op=lambda: td.op_criu_dump(criu_bin, pids, mark_dir, leave_running=True),
+        config={"mark_min": mark_min, "domain": "host"})
+    rec_c.extra["image_bytes"] = int(rec_c.extra.get("op_result") or 0)
+    if not keep_images:
+        shutil.rmtree(mark_dir, ignore_errors=True)
+
+    # phase 3: resume (host -> HBM), resumes inference (toggle back)
+    rec_r = measure_operation(
+        tele, workload="timed_dump", operation="cuda_restore",
+        state_bytes=gpu_before, baseline_seconds=baseline,
+        op=lambda: td.op_cuda_checkpoint(cc_bin, pids),
+        config={"mark_min": mark_min, "domain": "accelerator", "phase": "resume"})
+
+    for r in (rec_s, rec_c, rec_r):
+        r.extra["mark_min"] = mark_min
+        print_record(r)
+        write_record(r, "timed_dump")
+    print(f"[timed] mark {mark_min}min: suspend {rec_s.latency_s:.2f}s + "
+          f"dump {rec_c.latency_s:.2f}s ({rec_c.extra['image_bytes']/1e9:.1f}GB) + "
+          f"resume {rec_r.latency_s:.2f}s  | serving paused ~"
+          f"{rec_s.latency_s + rec_c.latency_s + rec_r.latency_s:.1f}s")
+    return rec_s, rec_c, rec_r
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="timed suspend/dump/resume during a live serving run")
+    ap.add_argument("--marks-min", default="10,20,30,40,50",
+                    help="comma-separated minute marks (relative to this start)")
+    ap.add_argument("--out", default="/mnt/md0/tdump")
+    ap.add_argument("--pids", default=None, help="override GPU PIDs (else NVML auto-detect)")
+    ap.add_argument("--baseline", type=float, default=5.0, help="telemetry baseline sec per phase")
+    ap.add_argument("--keep-images", action="store_true", help="don't delete CRIU images")
+    ap.add_argument("--criu-bin", default=None)
+    ap.add_argument("--cc-bin", default=None)
+    args = ap.parse_args()
+
+    pf = td.preflight(args)
+    print(f"[timed] cuda-checkpoint={pf['cuda_checkpoint']} criu={pf['criu']} euid={pf['euid']}")
+    if pf["problems"]:
+        for p in pf["problems"]:
+            print(f"[timed] BLOCKER: {p}")
+        raise SystemExit(1)
+
+    marks = sorted(int(m) for m in args.marks_min.split(",") if m.strip())
+    pids = ([int(p) for p in args.pids.split(",")] if args.pids else gpu_compute_pids())
+    if not pids:
+        raise SystemExit("[timed] no GPU PIDs found -- is serving running and holding the GPU?")
+    print(f"[timed] target GPU PIDs: {pids}")
+    print(f"[timed] marks (min): {marks}")
+
+    tele = build_telemetry()
+    tele.start()
+    t0 = time.monotonic()
+    try:
+        for m in marks:
+            target = t0 + m * 60
+            while time.monotonic() < target:
+                time.sleep(min(5.0, target - time.monotonic()))
+            # refresh PIDs in case they changed (auto-detect mode)
+            cur = pids if args.pids else (gpu_compute_pids() or pids)
+            print(f"\n[timed] === mark {m}min (t+{time.monotonic()-t0:.0f}s) pids={cur} ===")
+            try:
+                dump_and_resume(tele, pf["cuda_checkpoint"], pf["criu"], cur,
+                                args.out, m, args.baseline, args.keep_images)
+            except Exception as e:
+                print(f"[timed] mark {m}min FAILED: {type(e).__name__}: {e}")
+                print(f"[timed] (if criu errored, paste it -- likely needs extra flags)")
+        print(f"\n[timed] done. {len(marks)} marks -> data/timed_dump.jsonl")
+    finally:
+        tele.stop()
+
+
+if __name__ == "__main__":
+    main()
