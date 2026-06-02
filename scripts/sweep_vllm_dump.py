@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import os
 import signal
+import statistics
 import subprocess
 import sys
 import time
@@ -82,6 +83,8 @@ def main() -> None:
     ap.add_argument("--settle", type=float, default=20.0, help="wait after alloc before dumping")
     ap.add_argument("--min-gb", type=float, default=20.0, help="GPU mem that means 'allocated'")
     ap.add_argument("--timeout", type=float, default=300.0, help="max wait for vLLM startup")
+    ap.add_argument("--cycles", type=int, default=3, help="suspend/resume cycles per config (mean±std)")
+    ap.add_argument("--cycle-gap", type=float, default=5.0, help="serve-resume gap between cycles")
     args = ap.parse_args()
 
     pf = td.preflight(argparse.Namespace(cc_bin=None, criu_bin=None))
@@ -116,14 +119,23 @@ def main() -> None:
 
             tele = build_telemetry(nvml_gpus=tde.pid_gpu_indices(pids))
             tele.start()
+            cycles = []
             try:
-                recs = tde.dump_and_resume(
-                    tele, pf["cuda_checkpoint"], pf["criu"], pids,
-                    out_dir=args.store_out, mark_min=ci, baseline=args.baseline,
-                    keep_images=False, skip_criu=True, store=True, store_out=args.store_out)
+                for cyc in range(args.cycles):
+                    print(f"[sweep] config {ci} cycle {cyc + 1}/{args.cycles}")
+                    try:
+                        cycles.append(tde.dump_and_resume(
+                            tele, pf["cuda_checkpoint"], pf["criu"], pids,
+                            out_dir=args.store_out, mark_min=ci, baseline=args.baseline,
+                            keep_images=False, skip_criu=True, store=True, store_out=args.store_out))
+                    except Exception as e:
+                        print(f"[sweep] config {ci} cycle {cyc + 1} FAILED: {type(e).__name__}: {e}")
+                    if cyc < args.cycles - 1:
+                        time.sleep(args.cycle_gap)
             finally:
                 tele.stop()
-            rows.append((cfg, recs))
+            if cycles:
+                rows.append((cfg, cycles))
         except Exception as e:
             print(f"[sweep] config {ci} FAILED: {type(e).__name__}: {e}")
         finally:
@@ -140,20 +152,26 @@ def main() -> None:
                     break
                 time.sleep(2)
 
-    # --- summary ---
-    print(f"\n=== vLLM TP=1 DUMP-CYCLE SWEEP ({len(rows)} configs) ===")
-    print(f"{'config':42}{'foot_GB':>8}{'susp_s':>8}{'store_s':>8}{'load_s':>8}"
-          f"{'res_s':>7}{'dump_J':>9}{'restore_J':>11}")
-    for cfg, r in rows:
-        foot = r["suspend"].extra.get("gpu_freed_bytes", 0) / 1e9
-        ss, st = r["suspend"].latency_s, (r["store"].latency_s if r["store"] else 0)
-        ld, rs = (r["load"].latency_s if r["load"] else 0), r["resume"].latency_s
-        dump_j = cpu_abs(r["suspend"]) + cpu_abs(r["store"])
-        rest_j = cpu_abs(r["load"]) + cpu_abs(r["resume"])
-        print(f"{cfg[:42]:42}{foot:8.1f}{ss:8.2f}{st:8.2f}{ld:8.2f}{rs:7.2f}"
-              f"{dump_j:9.0f}{rest_j:11.0f}")
+    # --- summary (mean ± std over cycles) ---
+    def msd(vals):
+        if not vals:
+            return (0.0, 0.0)
+        return (statistics.mean(vals), statistics.stdev(vals) if len(vals) > 1 else 0.0)
+
+    print(f"\n=== vLLM TP=1 DUMP-CYCLE SWEEP ({len(rows)} configs x {args.cycles} cycles) ===  mean ± std")
+    print(f"{'config':34}{'foot_GB':>8}{'susp_s':>14}{'store_s':>8}{'res_s':>14}"
+          f"{'dump_J':>14}{'restore_J':>15}")
+    for cfg, cycles in rows:
+        foot, _ = msd([c["suspend"].extra.get("gpu_freed_bytes", 0) / 1e9 for c in cycles])
+        sm, ss = msd([c["suspend"].latency_s for c in cycles])
+        stm, _ = msd([c["store"].latency_s for c in cycles if c["store"]])
+        rm, rs = msd([c["resume"].latency_s for c in cycles])
+        dm, ds = msd([cpu_abs(c["suspend"]) + cpu_abs(c["store"]) for c in cycles])
+        rjm, rjs = msd([cpu_abs(c["load"]) + cpu_abs(c["resume"]) for c in cycles])
+        print(f"{cfg[:34]:34}{foot:8.1f}{sm:8.2f}±{ss:<5.2f}{stm:8.2f}"
+              f"{rm:8.2f}±{rs:<5.2f}{dm:8.0f}±{ds:<5.0f}{rjm:9.0f}±{rjs:<5.0f}")
     print("\ndump_J = suspend+store cpu_abs ; restore_J = load+resume cpu_abs. "
-          "Batch sweep -> foot_GB ~constant (tax); mem-util sweep -> foot_GB varies (S-curve).")
+          "Batch -> foot_GB ~constant (tax); mem-util -> foot_GB varies (S-curve).")
 
 
 if __name__ == "__main__":
