@@ -4,3 +4,11 @@ data/*.jsonl
 *.bin
 .venv/
 venv/
+
+# CRIU dump images / checkpoint artifacts (large; never commit)
+dumps/
+tdump/
+*.img
+pages-*
+pagemap-*
+
