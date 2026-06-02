@@ -62,6 +62,14 @@ def dd_read(path: str, nbytes: int) -> int:
     return count * _BS
 
 
+def cpu_abs_j(rec) -> float:
+    """CPU package energy incl. idle over the op = move + time term (the real cost)."""
+    for s in rec.sources:
+        if s.name == "cpu_pkg_energy_rapl" and s.energy_abs_j is not None:
+            return s.energy_abs_j
+    return 0.0
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="storage-tier write/read latency + energy")
     ap.add_argument("--bytes", type=float, default=16e9, help="bytes per write/read")
@@ -112,7 +120,8 @@ def main() -> None:
                     state_bytes=nbytes, baseline_seconds=args.baseline,
                     op=lambda p=path: read_op(p, nbytes),
                     config={"tier": name, "dir": d, "method": args.method, "trial": tag})
-                print(f"  [{name} {tag}] write {rec_w.latency_s:6.2f}s  read {rec_r.latency_s:6.2f}s")
+                print(f"  [{name} {tag}] write {rec_w.latency_s:6.2f}s {cpu_abs_j(rec_w):7.0f}J"
+                      f"   read {rec_r.latency_s:6.2f}s {cpu_abs_j(rec_r):7.0f}J")
                 if i >= args.warmup:
                     w_recs.append(rec_w); r_recs.append(rec_r)
                     write_record(rec_w, "storage_char"); write_record(rec_r, "storage_char")
@@ -136,12 +145,7 @@ def main() -> None:
         return [r.latency_s for r in recs]
 
     def cpuabs_list(recs):
-        out = []
-        for r in recs:
-            for s in r.sources:
-                if s.name == "cpu_pkg_energy_rapl" and s.energy_abs_j is not None:
-                    out.append(s.energy_abs_j)
-        return out
+        return [cpu_abs_j(r) for r in recs]
 
     print(f"\n=== STORAGE TIER CHARACTERIZATION ({nbytes/1e9:.0f} GB, method={args.method}, "
           f"n={args.repeat}) ===   mean ± std   (cpu_abs = move + time term = real dump cost)")
