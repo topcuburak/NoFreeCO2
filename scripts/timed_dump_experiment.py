@@ -34,8 +34,9 @@ import sys
 import time
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
+_REPO = os.path.dirname(_HERE)
 sys.path.insert(0, _HERE)                                   # for transparent_dump
-sys.path.insert(0, os.path.dirname(_HERE))                  # for harness/_common
+sys.path.insert(0, _REPO)                                   # for harness/_common
 
 import transparent_dump as td                               # noqa: E402  (reuse ops)
 from harness import measure_operation                       # noqa: E402
@@ -115,7 +116,8 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="timed suspend/dump/resume during a live serving run")
     ap.add_argument("--marks-min", default="10,20,30,40,50",
                     help="comma-separated minute marks (relative to this start)")
-    ap.add_argument("--out", default="/mnt/md0/tdump")
+    ap.add_argument("--out", default=os.path.join(_REPO, "dumps"),
+                    help="CRIU image dir (default: <repo>/dumps; gitignored)")
     ap.add_argument("--pids", default=None, help="override GPU PIDs (else NVML auto-detect)")
     ap.add_argument("--baseline", type=float, default=5.0, help="telemetry baseline sec per phase")
     ap.add_argument("--keep-images", action="store_true", help="don't delete CRIU images")

@@ -35,7 +35,8 @@ import subprocess
 import sys
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _REPO)
 
 from harness import measure_operation                              # noqa: E402
 from _common import build_telemetry, write_record, print_record    # noqa: E402
@@ -211,7 +212,8 @@ def main() -> None:
         description="Transparent dump (cuda-checkpoint + criu), measured + decomposed")
     ap.add_argument("--pids", default=None, help="comma-separated target PIDs")
     ap.add_argument("--proc-name", default=None, help="pgrep -f pattern (e.g. VllmWorker)")
-    ap.add_argument("--out", default="/mnt/md0/tdump", help="CRIU image dir (on NVMe)")
+    ap.add_argument("--out", default=os.path.join(_REPO, "dumps"),
+                    help="CRIU image dir (default: <repo>/dumps; gitignored)")
     ap.add_argument("--baseline", type=float, default=10.0, help="telemetry baseline seconds")
     ap.add_argument("--leave-running", action="store_true",
                     help="criu --leave-running (don't kill the process after dump)")
