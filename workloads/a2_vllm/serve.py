@@ -172,7 +172,12 @@ def main() -> None:
           f"tp={engine_args.tensor_parallel_size} "
           f"gpu_mem_util={engine_args.gpu_memory_utilization} "
           f"max_len={engine_args.max_model_len}")
-    llm = LLM(**dataclasses.asdict(engine_args))
+    # Shallow extract -- NOT dataclasses.asdict(), which recursively converts
+    # nested config objects (e.g. CompilationConfig) into dicts with None fields
+    # that fail pydantic validation when LLM reconstructs them.
+    engine_kwargs = {f.name: getattr(engine_args, f.name)
+                     for f in dataclasses.fields(engine_args)}
+    llm = LLM(**engine_kwargs)
 
     sampling = SamplingParams(
         temperature=args.temperature, top_p=args.top_p, max_tokens=args.max_tokens,
