@@ -36,7 +36,7 @@ def print_record(rec: RunRecord) -> None:
             gb = f" ({s.bytes_delta/1e9:.2f} GB)" if s.bytes_delta else ""
             print(f"  {s.name:22} bytes={s.bytes_delta}{gb}")
         else:
-            base = f" (idle {s.baseline_w:.1f} W)" if s.baseline_w else ""
+            base = f" (baseline {s.baseline_w:.1f} W)" if s.baseline_w else ""
             ej = f"{s.energy_j:.2f} J" if s.energy_j is not None else "n/a"
             abs_s = f" [abs {s.energy_abs_j:.1f} J]" if s.energy_abs_j is not None else ""
             print(f"  {s.name:22} {ej}{base}{abs_s}")
