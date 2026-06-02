@@ -32,10 +32,14 @@ def main() -> None:
     ap.add_argument("--bytes", type=float, default=4e9, help="bytes per iteration")
     ap.add_argument("--gpu", type=int, default=0)
     ap.add_argument("--baseline", type=float, default=10.0)
+    ap.add_argument("--scratch", default=None,
+                    help="dir for nvme_write (must be on the NVMe you want to measure; "
+                         "default: ford.yaml storage.scratch)")
     args = ap.parse_args()
 
     cfg = load("ford.yaml")
-    scratch = cfg.get("storage", {}).get("scratch", "/tmp")
+    scratch = args.scratch or cfg.get("storage", {}).get("scratch", "/tmp")
+    print(f"[microbench] nvme_write target dir: {scratch}")
     nbytes = int(args.bytes)
 
     tele = build_telemetry(cfg)
