@@ -41,6 +41,29 @@ def pcie_copy(nbytes: int, gpu: int = 0, iters: int = 50) -> int:
     return nbytes * iters
 
 
+def nvme_read(path: str, nbytes: int, iters: int = 1) -> int:
+    """host <- NVMe: read nbytes from an existing file. For a true device read,
+    drop page cache first (the characterize script does `echo 3 > drop_caches`).
+    Returns bytes read."""
+    import os
+    bufsize = 1 << 26  # 64 MB
+    total = 0
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        for _ in range(iters):
+            os.lseek(fd, 0, os.SEEK_SET)
+            remaining = nbytes
+            while remaining > 0:
+                chunk = os.read(fd, min(bufsize, remaining))
+                if not chunk:
+                    break
+                total += len(chunk)
+                remaining -= len(chunk)
+    finally:
+        os.close(fd)
+    return total
+
+
 def nvme_write(nbytes: int, path: str, iters: int = 10) -> int:
     """host DRAM -> NVMe. O_DIRECT-ish: flush + fsync to defeat page cache."""
     import os
