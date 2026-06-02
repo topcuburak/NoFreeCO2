@@ -50,10 +50,27 @@ except Exception:
 # --------------------------------------------------------------------------- #
 # preflight + helpers
 # --------------------------------------------------------------------------- #
-def preflight() -> dict:
+def _resolve(name: str, override: str | None, extra_dirs: list[str]) -> str | None:
+    """which(), then explicit override, then common sbin/cuda dirs (criu lives in
+    /usr/sbin on Debian, which sudo -E keeps out of PATH)."""
+    if override:
+        return override if os.path.exists(override) else None
+    p = shutil.which(name)
+    if p:
+        return p
+    for d in extra_dirs:
+        cand = os.path.join(d, name)
+        if os.path.exists(cand) and os.access(cand, os.X_OK):
+            return cand
+    return None
+
+
+def preflight(args) -> dict:
     info = {}
-    info["cuda_checkpoint"] = shutil.which("cuda-checkpoint")
-    info["criu"] = shutil.which("criu")
+    info["cuda_checkpoint"] = _resolve(
+        "cuda-checkpoint", args.cc_bin, ["/usr/local/bin", "/usr/local/cuda/bin"])
+    info["criu"] = _resolve(
+        "criu", args.criu_bin, ["/usr/sbin", "/sbin", "/usr/local/sbin"])
     info["euid"] = os.geteuid()
     problems = []
     if not info["cuda_checkpoint"]:
@@ -158,9 +175,11 @@ def main() -> None:
     ap.add_argument("--leave-running", action="store_true",
                     help="criu --leave-running (don't kill the process after dump)")
     ap.add_argument("--label", default="transparent_dump")
+    ap.add_argument("--criu-bin", default=None, help="explicit path to criu (else auto: /usr/sbin)")
+    ap.add_argument("--cc-bin", default=None, help="explicit path to cuda-checkpoint")
     args = ap.parse_args()
 
-    pf = preflight()
+    pf = preflight(args)
     print(f"[tdump] cuda-checkpoint={pf['cuda_checkpoint']} criu={pf['criu']} euid={pf['euid']}")
     if pf["problems"]:
         for p in pf["problems"]:
