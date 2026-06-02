@@ -38,6 +38,28 @@ import transparent_dump as td                     # noqa: E402
 import timed_dump_experiment as tde               # noqa: E402
 from _common import build_telemetry               # noqa: E402
 
+try:
+    import pynvml                                 # noqa: E402
+    _HAVE_NVML = True
+except Exception:
+    _HAVE_NVML = False
+
+
+def gpu_generating(min_util: int = 15) -> bool:
+    """True if any GPU is actively computing (>min_util%) -- i.e. vLLM is generating,
+    which only happens AFTER full init (weights + KV pool + warmup)."""
+    if not _HAVE_NVML:
+        return True
+    try:
+        pynvml.nvmlInit()
+        for i in range(pynvml.nvmlDeviceGetCount()):
+            h = pynvml.nvmlDeviceGetHandleByIndex(i)
+            if pynvml.nvmlDeviceGetUtilizationRates(h).gpu >= min_util:
+                return True
+    except Exception:
+        return True
+    return False
+
 
 def cpu_abs(rec) -> float:
     if rec is None:
@@ -49,21 +71,25 @@ def cpu_abs(rec) -> float:
 
 
 def wait_for_ready(min_gb: float, timeout_s: float, stable_s: float = 12.0):
-    """Wait until a process holds >= min_gb AND GPU memory has PLATEAUED (KV pool
-    fully allocated, not just weights). Dumping before the plateau captures only the
-    weights, so the footprint wouldn't reflect the pool / gpu-mem-util. Returns
-    (pids, used_bytes)."""
+    """Wait until vLLM is GENUINELY ready: GPU memory >= min_gb AND it has PLATEAUED
+    (KV pool allocated) AND we've observed the GPU GENERATING (util active). The
+    generation gate is the key fix -- the memory plateau alone fires on the profiling
+    pause (weights-only), and dumping then captures the wrong footprint and can break
+    a half-initialized process. Returns (pids, used_bytes)."""
     deadline = time.monotonic() + timeout_s
     last = -1.0
     stable_since = None
+    seen_gen = False
     while time.monotonic() < deadline:
         used = td.gpu_used_bytes()
         pids = tde.gpu_compute_pids()
-        if pids and used >= min_gb * 1e9:
-            if abs(used - last) < 1e9:                 # within 1 GB of the previous sample
+        if gpu_generating():
+            seen_gen = True                            # vLLM has started generating
+        if pids and used >= min_gb * 1e9 and seen_gen:
+            if abs(used - last) < 1e9:                 # memory stable within 1 GB
                 stable_since = stable_since or time.monotonic()
                 if time.monotonic() - stable_since >= stable_s:
-                    return pids, used                  # plateaued -> pool allocated
+                    return pids, used                  # fully initialized + generating + plateaued
             else:
                 stable_since = None
         last = used
