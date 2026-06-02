@@ -78,9 +78,10 @@ def measure_operation(
     sources: list[SourceResult] = []
     for ps in tele.power_sources:
         base = baselines.get(ps.name)
-        e = tele.traces[ps.name].integral_between(t_start, t_end, base or 0.0)
+        e = tele.traces[ps.name].integral_between(t_start, t_end, base or 0.0)   # marginal: ∫(P−base)dt
+        e_abs = tele.traces[ps.name].integral_between(t_start, t_end, 0.0)       # absolute: ∫P dt (>=0)
         sources.append(SourceResult(
-            name=ps.name, kind="power_integral", energy_j=e,
+            name=ps.name, kind="power_integral", energy_j=e, energy_abs_j=e_abs,
             baseline_w=base, peak_w=tele.traces[ps.name].peak_between(t_start, t_end),
             note="" if base is not None else "no baseline samples",
         ))
