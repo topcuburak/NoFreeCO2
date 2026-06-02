@@ -19,9 +19,13 @@ cpu:
 gpu_numa_map: { 0: 0, 1: 1, 2: 2, 3: 3 }
 
 storage:
-  scratch: "/mnt/md0"     # PM1733 RAID-0, ~7.6 GB/s write, ~14 GB/s read
+  scratch: "/var/data"    # md0 = 2x PM1733 RAID-0 (xfs), the fast NVMe tier
   seq_write_gbps: 7.6
   seq_read_gbps: 14.0
+  tiers:                  # measurable storage tiers for the sensitivity sweep
+    nvme_raid0: "/var/data"   # 2x PM1733 RAID-0 (md0, xfs)  -- ~7.6 GB/s
+    sas_ssd:    "/home/test"  # HPE SAS SSD (sda2, ext4)     -- ~0.5 GB/s
+    # single PM1733 not separately mountable (both in md0) -> model as raid0 / 2
 
 telemetry:
   power_sample_hz: 20             # >= 10 Hz required
