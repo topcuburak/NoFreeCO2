@@ -33,9 +33,11 @@ def print_record(rec: RunRecord) -> None:
     print(f"  latency: {rec.latency_s:.4f} s   state: {rec.state_bytes/1e9:.3f} GB")
     for s in rec.sources:
         if s.kind == "byte_counter":
-            print(f"  {s.name:22} bytes={s.bytes_delta}")
+            gb = f" ({s.bytes_delta/1e9:.2f} GB)" if s.bytes_delta else ""
+            print(f"  {s.name:22} bytes={s.bytes_delta}{gb}")
         else:
-            base = f" (baseline {s.baseline_w:.1f} W)" if s.baseline_w else ""
+            base = f" (idle {s.baseline_w:.1f} W)" if s.baseline_w else ""
             ej = f"{s.energy_j:.2f} J" if s.energy_j is not None else "n/a"
-            print(f"  {s.name:22} {ej}{base}")
-    print(f"  TOTAL measured: {rec.total_energy_j:.2f} J")
+            abs_s = f" [abs {s.energy_abs_j:.1f} J]" if s.energy_abs_j is not None else ""
+            print(f"  {s.name:22} {ej}{base}{abs_s}")
+    print(f"  TOTAL marginal: {rec.total_energy_j:.2f} J  (energy above idle)")

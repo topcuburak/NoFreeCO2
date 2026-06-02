@@ -15,9 +15,10 @@ class SourceResult:
     """Energy attributed to one telemetry source over the operation window."""
     name: str
     kind: str                 # "power_integral" | "energy_counter" | "byte_counter"
-    energy_j: float | None    # integral of (P - P_baseline) dt, or counter delta
+    energy_j: float | None    # MARGINAL energy: ∫(P - P_baseline)dt, or counter delta − idle
     baseline_w: float | None = None
     peak_w: float | None = None
+    energy_abs_j: float | None = None  # absolute energy over op (energy counters)
     bytes_delta: int | None = None   # for byte counters (NVMe SMART)
     available: bool = True
     note: str = ""

@@ -39,13 +39,23 @@ def measure_operation(
     config = config or {}
 
     # --- 1-2. baseline window (workload state held, no operation) ---
+    c_base0 = tele.read_counters()
     t_base0 = time.monotonic()
     time.sleep(baseline_seconds)
     t_base1 = time.monotonic()
+    c_base1 = tele.read_counters()
     baselines = {
         ps.name: tele.traces[ps.name].mean_between(t_base0, t_base1)
         for ps in tele.power_sources
     }
+    # baseline POWER for energy counters, so we can report MARGINAL (above-idle)
+    # energy instead of absolute (which is dominated by idle package draw).
+    base_dt = max(t_base1 - t_base0, 1e-9)
+    counter_base_w = {}
+    for cs in tele.counter_sources:
+        if cs.kind == "energy_counter":
+            a, b = c_base0.get(cs.name), c_base1.get(cs.name)
+            counter_base_w[cs.name] = ((b - a) / base_dt) if (a is not None and b is not None) else None
     time.sleep(settle_seconds)
 
     # --- 3. counters at T_start ---
@@ -74,13 +84,18 @@ def measure_operation(
             baseline_w=base, peak_w=tele.traces[ps.name].peak_between(t_start, t_end),
             note="" if base is not None else "no baseline samples",
         ))
+    op_dt = t_end - t_start
     for cs in tele.counter_sources:
         s0, s1 = c_start.get(cs.name), c_end.get(cs.name)
         delta = (s1 - s0) if (s0 is not None and s1 is not None) else None
         if cs.kind == "byte_counter":
-            sources.append(SourceResult(cs.name, cs.kind, energy_j=None, bytes_delta=int(delta) if delta is not None else None))
-        else:  # energy_counter (Joules)
-            sources.append(SourceResult(cs.name, cs.kind, energy_j=delta))
+            sources.append(SourceResult(cs.name, cs.kind, energy_j=None,
+                                        bytes_delta=int(delta) if delta is not None else None))
+        else:  # energy_counter: report MARGINAL energy (absolute delta − idle×op_time)
+            base_w = counter_base_w.get(cs.name)
+            marginal = (delta - base_w * op_dt) if (delta is not None and base_w is not None) else delta
+            sources.append(SourceResult(cs.name, cs.kind, energy_j=marginal,
+                                        baseline_w=base_w, energy_abs_j=delta))
 
     rec = RunRecord(
         run_id=_run_id(workload, operation),
