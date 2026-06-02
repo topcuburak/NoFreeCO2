@@ -63,8 +63,21 @@ Three things are **modeled, not measured** on this hardware (state in §4):
 conda env create -f environment.yml      # or: pip install -r requirements.txt
 conda activate socc-bench
 export HF_TOKEN=...                       # gated Llama-3.x weights/tokenizers
+source scripts/ford_env.sh               # CUDA_HOME + vLLM env vars (see below)
 # system packages for telemetry / A6: ipmitool, nvme-cli, criu
 ```
+
+### CUDA / vLLM on the testbed (important)
+
+On the current CUDA-13 vLLM build, two things must be set or vLLM fails at startup
+(`scripts/ford_env.sh` does both):
+
+1. **`CUDA_HOME`** → the pip CUDA wheel that carries `nvcc` (vLLM's `torch.compile`
+   needs it; the torch wheel ships only the runtime). If nvcc is missing, install it
+   (`pip install cuda-toolkit`) or run serve.py with `--enforce-eager` to skip compile.
+2. **`VLLM_USE_FLASHINFER_SAMPLER=0` + `VLLM_ATTENTION_BACKEND=FLASH_ATTN`** → flashinfer's
+   JIT sampler can't build (nvcc 13.3 vs 13.0 headers, no matching nvcc wheel), so we
+   disable it and use prebuilt FlashAttention-2. Verified working: TP=4, CUDA graphs on.
 
 ## Run
 
@@ -83,7 +96,8 @@ python workloads/a2_vllm/serve.py \
 python scripts/run_microbench.py --bytes 8e9
 ```
 
-> Status: A2 serving + LongBench-v2 prep are complete. The dump/restore mechanism
+> Status: A2 serving is complete and **verified on ford** (Llama-3.1-8B, TP=4, CUDA
+> graphs). LongBench-v2 prep is complete (pending a live run). The dump/restore mechanism
 > (`workloads/a2_vllm/dump_restore.py`) and the per-workload runners (A1, A3–A6)
 > are scaffolds with `TODO(ford)` markers. The measurement loop will be driven by a
 > generic `run_op.py` + per-workload adapter registry (planned).
