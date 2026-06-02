@@ -28,8 +28,9 @@ telemetry:
   baseline_seconds: 30           # pre-op idle window under same workload state
   pin_gpu_clock_mhz: 1410        # nvidia-smi -lgc to stop downclock during dump
   sources:
-    nvml:        true
-    perf_pkg:    true            # perf -e power/energy-pkg/  (cores+IOD)
-    ipmi:        true            # whole-node, captures NIC+NVMe RAPL misses
-    nvme_smart:  true            # byte cross-check
+    nvml:        true            # GPU package power (NVML)
+    rapl:        true            # CPU package energy via RAPL powercap (root) -- the AMD path
+    perf_pkg:    false           # amd_energy hwmon fallback (absent on ford; k10temp only)
+    ipmi:        false           # chassis power -- ipmitool not installed; enable if added
+    nvme_smart:  true            # NVMe bytes written via /sys/block/*/stat (no nvme-cli)
   dram_rapl: false               # AMD EPYC: no DRAM domain -> DRAM energy is modeled
