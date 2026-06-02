@@ -104,6 +104,57 @@ def _load_hf_dataset(repo: str, split: str, field: str) -> list[str]:
     return [row[field] for row in ds if field in row]
 
 
+def _pct(xs: list[float], p: float) -> float | None:
+    if not xs:
+        return None
+    s = sorted(xs)
+    k = (len(s) - 1) * (p / 100.0)
+    lo = int(k)
+    hi = min(lo + 1, len(s) - 1)
+    return s[lo] + (s[hi] - s[lo]) * (k - lo)
+
+
+def collect_latencies(outputs) -> dict:
+    """Per-request latency from vLLM RequestOutput.metrics, if populated.
+
+    ttft = first_token_time - arrival_time      (time to first token)
+    e2e  = finished_time   - arrival_time       (end-to-end, incl. queue/wave wait)
+    tpot = (finished - first_token) / (out_tok-1)  (time per output token, decode)
+
+    In offline batch mode arrival_time is ~shared, so ttft/e2e include the wait for
+    a sequence's wave to be scheduled -- i.e. realistic latency under this batch.
+    """
+    ttft, e2e, tpot = [], [], []
+    for o in outputs:
+        m = getattr(o, "metrics", None)
+        if not m:
+            continue
+        arr = getattr(m, "arrival_time", None)
+        ftt = getattr(m, "first_token_time", None)
+        fin = getattr(m, "finished_time", None)
+        n_out = len(o.outputs[0].token_ids)
+        if arr is not None and ftt is not None:
+            ttft.append(ftt - arr)
+        if arr is not None and fin is not None:
+            e2e.append(fin - arr)
+        if ftt is not None and fin is not None and n_out > 1:
+            tpot.append((fin - ftt) / (n_out - 1))
+    return {"ttft_s": ttft, "e2e_s": e2e, "tpot_s": tpot}
+
+
+def _summarize(xs: list[float]) -> dict | None:
+    if not xs:
+        return None
+    return {
+        "n": len(xs),
+        "mean": round(sum(xs) / len(xs), 4),
+        "p50": round(_pct(xs, 50), 4),
+        "p90": round(_pct(xs, 90), 4),
+        "p99": round(_pct(xs, 99), 4),
+        "max": round(max(xs), 4),
+    }
+
+
 def build_token_prompts(llm, n: int, input_len: int, seed: int):
     """Exact-length synthetic prompts for controlled long-context batching:
     n sequences, each exactly input_len random token ids. Returns vLLM inputs."""
@@ -131,6 +182,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     EngineArgs.add_cli_args(p)               # every vLLM engine knob
     p.set_defaults(model="meta-llama/Meta-Llama-3-8B")
+    # Default prefix caching OFF: with --repeat, identical prompts would hit the
+    # prefix cache and skip prefill (no real duration increase). Re-enable with
+    # --enable-prefix-caching if you want it.
+    p.set_defaults(enable_prefix_caching=False)
 
     g = p.add_argument_group("dataset")
     g.add_argument("--dataset", default=None,
@@ -142,6 +197,9 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--num-prompts", type=int, default=1000,
                    help="number of sequences (= batch size in --input-len mode)")
     g.add_argument("--shuffle", action="store_true")
+    g.add_argument("--repeat", type=int, default=1,
+                   help="replay the loaded prompt set this many times for a linear "
+                        "duration increase (pair with prefix caching OFF, the default)")
 
     lc = p.add_argument_group("long-context / synthetic")
     lc.add_argument("--input-len", type=int, default=None,
@@ -192,6 +250,13 @@ def main() -> None:
         inputs = load_prompts(args)
         print(f"[a2] {len(inputs)} prompts ready")
 
+    unique = len(inputs)
+    if args.repeat > 1:
+        inputs = list(inputs) * args.repeat
+    pc = getattr(engine_args, "enable_prefix_caching", None)
+    print(f"[a2] prefix_caching={pc}  repeat=x{args.repeat}  "
+          f"unique={unique}  total_requests={len(inputs)}")
+
     print(f"[a2] generating ({len(inputs)} seqs, max_tokens={args.max_tokens}) ...")
     t0 = time.perf_counter()
     outputs = llm.generate(inputs, sampling)
@@ -202,6 +267,9 @@ def main() -> None:
     metrics = {
         "model": engine_args.model,
         "num_prompts": len(outputs),
+        "unique_prompts": unique,
+        "repeat": args.repeat,
+        "prefix_caching": getattr(engine_args, "enable_prefix_caching", None),
         "elapsed_s": round(elapsed, 3),
         "input_tokens": in_tok,
         "output_tokens": out_tok,
