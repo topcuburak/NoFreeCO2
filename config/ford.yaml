@@ -1,0 +1,35 @@
+# ford testbed configuration (as of 2026-05-28). Used by the harness for
+# pinning, NUMA placement, and which telemetry sources to expect.
+
+gpus:
+  count: 4
+  model: "NVIDIA A100 SXM4 40GB"
+  pcie: "Gen4 x16"
+  nvlink: "NV4 mesh, ~100 GB/s/dir per pair"
+
+cpu:
+  model: "AMD EPYC 75F3 (Milan)"
+  sockets: 1
+  cores: 32
+  threads: 64
+  numa_nodes: 4
+  cores_per_numa: 8       # each GPU pinned to one NUMA node
+
+# GPU index -> NUMA node (VERIFY on ford with `nvidia-smi topo -m` / `lstopo`).
+gpu_numa_map: { 0: 0, 1: 1, 2: 2, 3: 3 }
+
+storage:
+  scratch: "/mnt/md0"     # PM1733 RAID-0, ~7.6 GB/s write, ~14 GB/s read
+  seq_write_gbps: 7.6
+  seq_read_gbps: 14.0
+
+telemetry:
+  power_sample_hz: 20             # >= 10 Hz required
+  baseline_seconds: 30           # pre-op idle window under same workload state
+  pin_gpu_clock_mhz: 1410        # nvidia-smi -lgc to stop downclock during dump
+  sources:
+    nvml:        true
+    perf_pkg:    true            # perf -e power/energy-pkg/  (cores+IOD)
+    ipmi:        true            # whole-node, captures NIC+NVMe RAPL misses
+    nvme_smart:  true            # byte cross-check
+  dram_rapl: false               # AMD EPYC: no DRAM domain -> DRAM energy is modeled

@@ -1,0 +1,30 @@
+# Conda environment for socc-bench.
+#   conda env create -f environment.yml
+#   conda activate socc-bench
+#
+# vLLM is installed via pip (it pulls a matching torch build). If your server's
+# CUDA/driver needs a specific vLLM/torch, pin `vllm==X.Y.Z` below to match.
+# Gated models/tokenizers (Llama-3.x) need HF_TOKEN exported before running.
+name: socc-bench
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      # --- A2 serving workload ---
+      - vllm                 # pin to match server CUDA/torch if needed
+      - transformers
+      - datasets             # LongBench-v2 prep
+      - huggingface_hub
+      - accelerate
+      # --- measurement harness ---
+      - nvidia-ml-py         # provides `import pynvml` (GPU package power)
+      - pyyaml
+      - numpy
+      # --- optional, per-workload (uncomment as you implement them) ---
+      # - timm               # A3 ViT-Large
+      # - torchrec           # A4 DLRMv2
+      # A1 FSDP uses torch (pulled by vllm); A5 HACC + A6 gem5/CRIU are
+      # external binaries (install via system pkg manager on the server):
+      #   ipmitool, nvme-cli  (telemetry)   |   criu (A6 host-domain dump)

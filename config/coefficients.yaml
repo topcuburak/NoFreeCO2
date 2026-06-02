@@ -1,0 +1,18 @@
+# Locked per-byte energy coefficients (ford testbed).
+# Units: pJ/bit. Sources: spec / datasheet / literature; * = validate with microbench.
+# See socc-2026-paper-measurement-plan.md for provenance.
+
+hbm2e_a100:        { pj_per_bit: 3.5,  bandwidth_gbps: 1500, source: spec }          # * validate via hbm_copy
+nvlink3:           { pj_per_bit: 7.0,  bandwidth_gbps: 100,  source: spec }
+pcie_gen4_x16:     { pj_per_bit: 9.0,  bandwidth_gbps: 26,   source: spec }          # spec ~5, expect 7-12 measured *
+ddr4_host:         { pj_per_bit: 10.0, bandwidth_gbps: 50,   source: literature }    # modeled: no DRAM RAPL on EPYC
+nvme_gen4_write:   { pj_per_bit: 65.0, bandwidth_gbps: 7.6,  source: datasheet }     # PM1733 RAID-0 seq write *
+nvme_gen4_read:    { pj_per_bit: 50.0, bandwidth_gbps: 14.0, source: datasheet }     # PM1733 RAID-0 seq read *
+nic:               { pj_per_bit: 35.0, bandwidth_gbps: 100,  source: literature }    # 20-50 range, most contested
+wan:               { pj_per_bit: 5000, bandwidth_gbps: null, source: literature }    # 1-100 nJ/bit; sensitivity +/-50%
+
+# Idle / holding power for temporal-shift cost (Watts).
+idle_power_w:
+  a100_power_gated:   70
+  a100_parked_alloc:  250
+  a100_held_warm:     null   # ~active baseline, measure per workload

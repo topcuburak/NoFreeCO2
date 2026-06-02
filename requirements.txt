@@ -1,0 +1,21 @@
+# pip-only install (alternative to environment.yml).
+#   python -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
+# On the server prefer the conda env (environment.yml) so vLLM picks a matching
+# torch/CUDA build. Pin `vllm==X.Y.Z` to match your server if needed.
+
+# --- A2 serving workload ---
+vllm
+transformers
+datasets
+huggingface_hub
+accelerate
+
+# --- measurement harness ---
+nvidia-ml-py        # provides `import pynvml` (GPU package power)
+pyyaml
+numpy
+
+# --- optional, per-workload (uncomment as implemented) ---
+# timm              # A3 ViT-Large
+# torchrec          # A4 DLRMv2
+# A5 HACC / A6 gem5+CRIU are external binaries: ipmitool, nvme-cli, criu (system pkgs)
