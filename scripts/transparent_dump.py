@@ -142,25 +142,66 @@ def host_free_bytes() -> int:
 # --------------------------------------------------------------------------- #
 # the two measured operations
 # --------------------------------------------------------------------------- #
-def op_cuda_checkpoint(cc_bin: str, pids: list[int]) -> int:
-    """Phase 1: toggle each PID running -> checkpointed (HBM copied to host, GPU freed)."""
-    for pid in pids:
-        subprocess.run([cc_bin, "--toggle", "--pid", str(pid)],
-                       check=True, capture_output=True, text=True)
+def _cc(cc_bin: str, pid: int, *cc_args: str) -> None:
+    subprocess.run([cc_bin, *cc_args, "--pid", str(pid)],
+                   check=True, capture_output=True, text=True)
+
+
+def cuda_suspend(cc_bin: str, pids: list[int], multiproc: bool = False) -> int:
+    """running -> checkpointed (HBM -> host, GPU freed).
+
+    TP=1 (single proc): per-pid --toggle.
+    TP>1 (multiproc):  lock ALL first (drains in-flight NCCL collectives to a
+    consistent, collective-free point), THEN checkpoint ALL. Locking one proc
+    while others run mid-collective would deadlock -- hence lock-all-then-ckpt-all.
+    """
+    if multiproc:
+        for p in pids:
+            _cc(cc_bin, p, "--action", "lock")
+        for p in pids:
+            _cc(cc_bin, p, "--action", "checkpoint")
+    else:
+        for p in pids:
+            _cc(cc_bin, p, "--toggle")
     return len(pids)
 
 
-def op_criu_dump(criu_bin: str, pids: list[int], out_dir: str, leave_running: bool) -> int:
-    """Phase 2: criu dump the (now GPU-free) process image to NVMe. Returns image bytes."""
+def cuda_resume(cc_bin: str, pids: list[int], multiproc: bool = False) -> int:
+    """checkpointed -> running (host -> HBM). multiproc: restore ALL then unlock ALL.
+    (--device-map can be added to restore when GPUs differ -- for migration.)"""
+    if multiproc:
+        for p in pids:
+            _cc(cc_bin, p, "--action", "restore")
+        for p in pids:
+            _cc(cc_bin, p, "--action", "unlock")
+    else:
+        for p in reversed(pids):
+            _cc(cc_bin, p, "--toggle")
+    return len(pids)
+
+
+# kept for back-compat (TP=1 single-phase callers)
+def op_cuda_checkpoint(cc_bin: str, pids: list[int]) -> int:
+    return cuda_suspend(cc_bin, pids, multiproc=False)
+
+
+def op_criu_dump(criu_bin: str, pids: list[int], out_dir: str, leave_running: bool,
+                 criu_root: int | None = None) -> int:
+    """criu dump the (now GPU-free) process image to NVMe. Returns image bytes.
+
+    criu_root set (TP>1): dump the tree rooted at that PID (-t root captures all
+    descendant workers as one consistent set). Else dump each pid separately (TP=1).
+    """
     os.makedirs(out_dir, exist_ok=True)
-    for pid in pids:
+    targets = [criu_root] if criu_root else pids
+    for pid in targets:
         d = os.path.join(out_dir, f"pid_{pid}")
         os.makedirs(d, exist_ok=True)
         cmd = [criu_bin, "dump", "-t", str(pid), "-D", d, "--shell-job"]
         if leave_running:
             cmd.append("--leave-running")
-        # NOTE(ford): real procs may need --tcp-established, --ext-unix-sk,
-        # --file-locks, or a tree dump. Tune here once you see what criu complains about.
+        # NOTE(ford): real procs often need extra flags -- add as criu complains:
+        #   --tcp-established --ext-unix-sk --file-locks --link-remap
         subprocess.run(cmd, check=True, capture_output=True, text=True)
     return dir_size_bytes(out_dir)
 
@@ -177,6 +218,10 @@ def main() -> None:
     ap.add_argument("--label", default="transparent_dump")
     ap.add_argument("--criu-bin", default=None, help="explicit path to criu (else auto: /usr/sbin)")
     ap.add_argument("--cc-bin", default=None, help="explicit path to cuda-checkpoint")
+    ap.add_argument("--multiproc", action="store_true",
+                    help="TP>1: lock ALL pids then checkpoint ALL (instead of per-pid --toggle)")
+    ap.add_argument("--criu-root", type=int, default=None,
+                    help="TP>1: root PID for a criu tree dump (parent of the workers)")
     args = ap.parse_args()
 
     pf = preflight(args)
@@ -206,8 +251,8 @@ def main() -> None:
         rec1 = measure_operation(
             tele, workload=args.label, operation="cuda_checkpoint",
             state_bytes=gpu_before, baseline_seconds=args.baseline,
-            op=lambda: op_cuda_checkpoint(pf["cuda_checkpoint"], pids),
-            config={"pids": pids, "domain": "accelerator"},
+            op=lambda: cuda_suspend(pf["cuda_checkpoint"], pids, args.multiproc),
+            config={"pids": pids, "domain": "accelerator", "multiproc": args.multiproc},
         )
         gpu_after = gpu_used_bytes()
         rec1.extra["gpu_freed_bytes"] = gpu_before - gpu_after
@@ -220,8 +265,10 @@ def main() -> None:
         rec2 = measure_operation(
             tele, workload=args.label, operation="criu_dump",
             state_bytes=host_footprint, baseline_seconds=args.baseline,
-            op=lambda: op_criu_dump(pf["criu"], pids, args.out, args.leave_running),
-            config={"pids": pids, "domain": "host", "out": args.out},
+            op=lambda: op_criu_dump(pf["criu"], pids, args.out, args.leave_running,
+                                    criu_root=args.criu_root),
+            config={"pids": pids, "domain": "host", "out": args.out,
+                    "criu_root": args.criu_root},
         )
         img_bytes = int(rec2.extra.get("op_result") or 0)
         rec2.extra["image_bytes"] = img_bytes

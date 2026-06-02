@@ -64,7 +64,8 @@ def gpu_compute_pids() -> list[int]:
     return sorted(pids)
 
 
-def dump_and_resume(tele, cc_bin, criu_bin, pids, out_dir, mark_min, baseline, keep_images):
+def dump_and_resume(tele, cc_bin, criu_bin, pids, out_dir, mark_min, baseline, keep_images,
+                    multiproc=False, criu_root=None):
     """One suspend->dump->resume cycle, 3 measured records, tagged by mark."""
     gpu_before = td.gpu_used_bytes()
     mark_dir = os.path.join(out_dir, f"mark_{mark_min}min")
@@ -73,8 +74,9 @@ def dump_and_resume(tele, cc_bin, criu_bin, pids, out_dir, mark_min, baseline, k
     rec_s = measure_operation(
         tele, workload="timed_dump", operation="cuda_checkpoint",
         state_bytes=gpu_before, baseline_seconds=baseline,
-        op=lambda: td.op_cuda_checkpoint(cc_bin, pids),
-        config={"mark_min": mark_min, "domain": "accelerator", "phase": "suspend"})
+        op=lambda: td.cuda_suspend(cc_bin, pids, multiproc),
+        config={"mark_min": mark_min, "domain": "accelerator", "phase": "suspend",
+                "multiproc": multiproc})
     gpu_after = td.gpu_used_bytes()
     rec_s.extra["gpu_freed_bytes"] = gpu_before - gpu_after
 
@@ -83,18 +85,20 @@ def dump_and_resume(tele, cc_bin, criu_bin, pids, out_dir, mark_min, baseline, k
     rec_c = measure_operation(
         tele, workload="timed_dump", operation="criu_dump",
         state_bytes=rss, baseline_seconds=baseline,
-        op=lambda: td.op_criu_dump(criu_bin, pids, mark_dir, leave_running=True),
+        op=lambda: td.op_criu_dump(criu_bin, pids, mark_dir, leave_running=True,
+                                   criu_root=criu_root),
         config={"mark_min": mark_min, "domain": "host"})
     rec_c.extra["image_bytes"] = int(rec_c.extra.get("op_result") or 0)
     if not keep_images:
         shutil.rmtree(mark_dir, ignore_errors=True)
 
-    # phase 3: resume (host -> HBM), resumes inference (toggle back)
+    # phase 3: resume (host -> HBM), resumes inference
     rec_r = measure_operation(
         tele, workload="timed_dump", operation="cuda_restore",
         state_bytes=gpu_before, baseline_seconds=baseline,
-        op=lambda: td.op_cuda_checkpoint(cc_bin, pids),
-        config={"mark_min": mark_min, "domain": "accelerator", "phase": "resume"})
+        op=lambda: td.cuda_resume(cc_bin, pids, multiproc),
+        config={"mark_min": mark_min, "domain": "accelerator", "phase": "resume",
+                "multiproc": multiproc})
 
     for r in (rec_s, rec_c, rec_r):
         r.extra["mark_min"] = mark_min
@@ -117,6 +121,10 @@ def main() -> None:
     ap.add_argument("--keep-images", action="store_true", help="don't delete CRIU images")
     ap.add_argument("--criu-bin", default=None)
     ap.add_argument("--cc-bin", default=None)
+    ap.add_argument("--multiproc", action="store_true",
+                    help="TP>1: lock-all then checkpoint-all (and restore-all/unlock-all)")
+    ap.add_argument("--criu-root", type=int, default=None,
+                    help="TP>1: root PID for criu tree dump (parent of the workers)")
     args = ap.parse_args()
 
     pf = td.preflight(args)
@@ -146,7 +154,8 @@ def main() -> None:
             print(f"\n[timed] === mark {m}min (t+{time.monotonic()-t0:.0f}s) pids={cur} ===")
             try:
                 dump_and_resume(tele, pf["cuda_checkpoint"], pf["criu"], cur,
-                                args.out, m, args.baseline, args.keep_images)
+                                args.out, m, args.baseline, args.keep_images,
+                                multiproc=args.multiproc, criu_root=args.criu_root)
             except Exception as e:
                 print(f"[timed] mark {m}min FAILED: {type(e).__name__}: {e}")
                 print(f"[timed] (if criu errored, paste it -- likely needs extra flags)")
