@@ -66,7 +66,7 @@ def gpu_compute_pids() -> list[int]:
 
 
 def dump_and_resume(tele, cc_bin, criu_bin, pids, out_dir, mark_min, baseline, keep_images,
-                    multiproc=False, criu_root=None):
+                    multiproc=False, criu_root=None, hold_seconds=0.0):
     """One suspend->dump->resume cycle, 3 measured records, tagged by mark."""
     gpu_before = td.gpu_used_bytes()
     mark_dir = os.path.join(out_dir, f"mark_{mark_min}min")
@@ -92,6 +92,22 @@ def dump_and_resume(tele, cc_bin, criu_bin, pids, out_dir, mark_min, baseline, k
     rec_c.extra["image_bytes"] = int(rec_c.extra.get("op_result") or 0)
     if not keep_images:
         shutil.rmtree(mark_dir, ignore_errors=True)
+
+    # optional hold: observe the checkpointed state (nvidia-smi shows GPU freed;
+    # image at mark_dir if --keep-images) and capture idle-holding power E_idle.
+    if hold_seconds > 0:
+        img_note = mark_dir if keep_images else "(image deleted; use --keep-images to inspect)"
+        print(f"[timed] HOLDING checkpointed/suspended for {hold_seconds:.0f}s -- "
+              f"observe `nvidia-smi` (GPU freed) and {img_note}")
+        gpu_idle = td.gpu_used_bytes()
+        rec_h = measure_operation(
+            tele, workload="timed_dump", operation="idle_hold",
+            state_bytes=gpu_idle, baseline_seconds=min(baseline, 2.0),
+            op=lambda: time.sleep(hold_seconds),
+            config={"mark_min": mark_min, "domain": "host", "phase": "hold",
+                    "hold_seconds": hold_seconds})
+        rec_h.extra["mark_min"] = mark_min
+        write_record(rec_h, "timed_dump")
 
     # phase 3: resume (host -> HBM), resumes inference
     rec_r = measure_operation(
@@ -123,6 +139,9 @@ def main() -> None:
     ap.add_argument("--keep-images", action="store_true", help="don't delete CRIU images")
     ap.add_argument("--criu-bin", default=None)
     ap.add_argument("--cc-bin", default=None)
+    ap.add_argument("--hold-seconds", type=float, default=0.0,
+                    help="hold the checkpointed/suspended state this long before resume "
+                         "(observe nvidia-smi/dump; measures idle-holding power)")
     ap.add_argument("--multiproc", action="store_true",
                     help="TP>1: lock-all then checkpoint-all (and restore-all/unlock-all)")
     ap.add_argument("--criu-root", type=int, default=None,
@@ -157,7 +176,8 @@ def main() -> None:
             try:
                 dump_and_resume(tele, pf["cuda_checkpoint"], pf["criu"], cur,
                                 args.out, m, args.baseline, args.keep_images,
-                                multiproc=args.multiproc, criu_root=args.criu_root)
+                                multiproc=args.multiproc, criu_root=args.criu_root,
+                                hold_seconds=args.hold_seconds)
             except Exception as e:
                 print(f"[timed] mark {m}min FAILED: {type(e).__name__}: {e}")
                 print(f"[timed] (if criu errored, paste it -- likely needs extra flags)")

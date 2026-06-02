@@ -203,7 +203,11 @@ def op_criu_dump(criu_bin: str, pids: list[int], out_dir: str, leave_running: bo
             cmd.append("--leave-running")
         # NOTE(ford): real procs often need extra flags -- add as criu complains:
         #   --tcp-established --ext-unix-sk --file-locks --link-remap
-        subprocess.run(cmd, check=True, capture_output=True, text=True)
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0:
+            # surface criu's actual complaint (also in {d}/dump.log)
+            tail = (r.stderr or "")[-2500:]
+            raise RuntimeError(f"criu dump failed for pid {pid} (see {d}/dump.log):\n{tail}")
     return dir_size_bytes(out_dir)
 
 
