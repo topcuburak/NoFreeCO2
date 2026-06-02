@@ -29,6 +29,7 @@ def hbm_copy(nbytes: int, gpu: int = 0, iters: int = 50) -> int:
 
 
 def pcie_copy(nbytes: int, gpu: int = 0, iters: int = 50) -> int:
+    """HBM -> pinned host (D2H): the dump/suspend EXTRACT leg. Returns bytes moved."""
     import torch
     dev = torch.device(f"cuda:{gpu}")
     n = nbytes // 2
@@ -37,6 +38,20 @@ def pcie_copy(nbytes: int, gpu: int = 0, iters: int = 50) -> int:
     torch.cuda.synchronize(dev)
     for _ in range(iters):
         host.copy_(src)           # D2H over PCIe -> DRAM write
+    torch.cuda.synchronize(dev)
+    return nbytes * iters
+
+
+def pcie_copy_h2d(nbytes: int, gpu: int = 0, iters: int = 50) -> int:
+    """pinned host -> HBM (H2D): the RESTORE leg (reverse of pcie_copy). Bytes moved."""
+    import torch
+    dev = torch.device(f"cuda:{gpu}")
+    n = nbytes // 2
+    dst = torch.empty(n, dtype=torch.float16, device=dev)
+    host = torch.empty(n, dtype=torch.float16, pin_memory=True)
+    torch.cuda.synchronize(dev)
+    for _ in range(iters):
+        dst.copy_(host)           # H2D over PCIe -> HBM write
     torch.cuda.synchronize(dev)
     return nbytes * iters
 
