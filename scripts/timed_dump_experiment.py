@@ -66,12 +66,17 @@ def gpu_compute_pids() -> list[int]:
 
 
 def dump_and_resume(tele, cc_bin, criu_bin, pids, out_dir, mark_min, baseline, keep_images,
-                    multiproc=False, criu_root=None, hold_seconds=0.0):
-    """One suspend->dump->resume cycle, 3 measured records, tagged by mark."""
+                    multiproc=False, criu_root=None, hold_seconds=0.0, skip_criu=False):
+    """One suspend->[dump]->resume cycle, measured records tagged by mark.
+
+    skip_criu: skip the host criu_dump phase (it's blocked by io_uring on stock
+    criu) and measure only the cuda-checkpoint footprint + resume. The store cost
+    then comes from the storage characterization, not a live criu image.
+    """
     gpu_before = td.gpu_used_bytes()
     mark_dir = os.path.join(out_dir, f"mark_{mark_min}min")
 
-    # phase 1: suspend (HBM -> host), pauses inference
+    # phase 1: suspend (HBM -> host), pauses inference -- the footprint cuda-checkpoint dumps
     rec_s = measure_operation(
         tele, workload="timed_dump", operation="cuda_checkpoint",
         state_bytes=gpu_before, baseline_seconds=baseline,
@@ -81,17 +86,19 @@ def dump_and_resume(tele, cc_bin, criu_bin, pids, out_dir, mark_min, baseline, k
     gpu_after = td.gpu_used_bytes()
     rec_s.extra["gpu_freed_bytes"] = gpu_before - gpu_after
 
-    # phase 2: persist (host -> NVMe)
-    rss = td.rss_bytes(pids)
-    rec_c = measure_operation(
-        tele, workload="timed_dump", operation="criu_dump",
-        state_bytes=rss, baseline_seconds=baseline,
-        op=lambda: td.op_criu_dump(criu_bin, pids, mark_dir, leave_running=True,
-                                   criu_root=criu_root),
-        config={"mark_min": mark_min, "domain": "host"})
-    rec_c.extra["image_bytes"] = int(rec_c.extra.get("op_result") or 0)
-    if not keep_images:
-        shutil.rmtree(mark_dir, ignore_errors=True)
+    # phase 2: persist (host -> NVMe) -- optional (criu blocked by io_uring on ford)
+    rec_c = None
+    if not skip_criu:
+        rss = td.rss_bytes(pids)
+        rec_c = measure_operation(
+            tele, workload="timed_dump", operation="criu_dump",
+            state_bytes=rss, baseline_seconds=baseline,
+            op=lambda: td.op_criu_dump(criu_bin, pids, mark_dir, leave_running=True,
+                                       criu_root=criu_root),
+            config={"mark_min": mark_min, "domain": "host"})
+        rec_c.extra["image_bytes"] = int(rec_c.extra.get("op_result") or 0)
+        if not keep_images:
+            shutil.rmtree(mark_dir, ignore_errors=True)
 
     # optional hold: observe the checkpointed state (nvidia-smi shows GPU freed;
     # image at mark_dir if --keep-images) and capture idle-holding power E_idle.
@@ -117,14 +124,17 @@ def dump_and_resume(tele, cc_bin, criu_bin, pids, out_dir, mark_min, baseline, k
         config={"mark_min": mark_min, "domain": "accelerator", "phase": "resume",
                 "multiproc": multiproc})
 
-    for r in (rec_s, rec_c, rec_r):
+    recs = [rec_s] + ([rec_c] if rec_c else []) + [rec_r]
+    for r in recs:
         r.extra["mark_min"] = mark_min
         print_record(r)
         write_record(r, "timed_dump")
-    print(f"[timed] mark {mark_min}min: suspend {rec_s.latency_s:.2f}s + "
-          f"dump {rec_c.latency_s:.2f}s ({rec_c.extra['image_bytes']/1e9:.1f}GB) + "
-          f"resume {rec_r.latency_s:.2f}s  | serving paused ~"
-          f"{rec_s.latency_s + rec_c.latency_s + rec_r.latency_s:.1f}s")
+    footprint_gb = rec_s.extra.get("gpu_freed_bytes", 0) / 1e9
+    dump_s = rec_c.latency_s if rec_c else 0.0
+    paused = rec_s.latency_s + dump_s + rec_r.latency_s
+    print(f"[timed] mark {mark_min}min: FOOTPRINT {footprint_gb:.1f} GB | "
+          f"suspend {rec_s.latency_s:.2f}s + dump {dump_s:.2f}s + resume {rec_r.latency_s:.2f}s "
+          f"| serving paused ~{paused:.1f}s")
     return rec_s, rec_c, rec_r
 
 
@@ -146,6 +156,9 @@ def main() -> None:
                     help="TP>1: lock-all then checkpoint-all (and restore-all/unlock-all)")
     ap.add_argument("--criu-root", type=int, default=None,
                     help="TP>1: root PID for criu tree dump (parent of the workers)")
+    ap.add_argument("--skip-criu", action="store_true",
+                    help="skip the host criu_dump phase (blocked by io_uring on ford); "
+                         "measure cuda-checkpoint footprint + resume only")
     args = ap.parse_args()
 
     pf = td.preflight(args)
@@ -177,7 +190,7 @@ def main() -> None:
                 dump_and_resume(tele, pf["cuda_checkpoint"], pf["criu"], cur,
                                 args.out, m, args.baseline, args.keep_images,
                                 multiproc=args.multiproc, criu_root=args.criu_root,
-                                hold_seconds=args.hold_seconds)
+                                hold_seconds=args.hold_seconds, skip_criu=args.skip_criu)
             except Exception as e:
                 print(f"[timed] mark {m}min FAILED: {type(e).__name__}: {e}")
                 print(f"[timed] (if criu errored, paste it -- likely needs extra flags)")
