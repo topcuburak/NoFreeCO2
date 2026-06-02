@@ -193,7 +193,8 @@ def dump_and_resume(tele, cc_bin, criu_bin, pids, out_dir, mark_min, baseline, k
     print(f"[timed] mark {mark_min}min: FOOTPRINT {footprint_gb:.1f} GB | "
           f"suspend {rec_s.latency_s:.2f}s + store {store_s:.2f}s + load {load_s:.2f}s + "
           f"resume {rec_r.latency_s:.2f}s")
-    return rec_s, rec_c, rec_r
+    return {"suspend": rec_s, "criu": rec_c, "store": rec_store,
+            "load": rec_load, "resume": rec_r}
 
 
 def main() -> None:
