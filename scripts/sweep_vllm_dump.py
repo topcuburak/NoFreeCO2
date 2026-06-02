@@ -59,6 +59,7 @@ def wait_for_alloc(min_gb: float, timeout_s: float):
 
 
 def main() -> None:
+    sys.stdout.reconfigure(line_buffering=True)   # live logs under nohup/redirect
     ap = argparse.ArgumentParser(description="sweep vLLM TP=1 configs through a dump cycle")
     ap.add_argument("--model", default="meta-llama/Llama-3.1-8B")
     ap.add_argument("--base", default="--max-model-len 16384 --max-tokens 256",
