@@ -47,15 +47,27 @@ def cpu_abs(rec) -> float:
     return 0.0
 
 
-def wait_for_alloc(min_gb: float, timeout_s: float):
-    """Poll until a process holds >= min_gb of GPU memory (KV pool allocated)."""
+def wait_for_ready(min_gb: float, timeout_s: float, stable_s: float = 12.0):
+    """Wait until a process holds >= min_gb AND GPU memory has PLATEAUED (KV pool
+    fully allocated, not just weights). Dumping before the plateau captures only the
+    weights, so the footprint wouldn't reflect the pool / gpu-mem-util. Returns
+    (pids, used_bytes)."""
     deadline = time.monotonic() + timeout_s
+    last = -1.0
+    stable_since = None
     while time.monotonic() < deadline:
+        used = td.gpu_used_bytes()
         pids = tde.gpu_compute_pids()
-        if pids and td.gpu_used_bytes() >= min_gb * 1e9:
-            return pids
+        if pids and used >= min_gb * 1e9:
+            if abs(used - last) < 1e9:                 # within 1 GB of the previous sample
+                stable_since = stable_since or time.monotonic()
+                if time.monotonic() - stable_since >= stable_s:
+                    return pids, used                  # plateaued -> pool allocated
+            else:
+                stable_since = None
+        last = used
         time.sleep(3)
-    return None
+    return None, 0.0
 
 
 def main() -> None:
@@ -93,11 +105,12 @@ def main() -> None:
         proc = subprocess.Popen(cmd, env=serve_env, start_new_session=True,
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
-            pids = wait_for_alloc(args.min_gb, args.timeout)
+            pids, used = wait_for_ready(args.min_gb, args.timeout)
             if not pids:
-                print(f"[sweep] config {ci}: TIMEOUT waiting for GPU alloc -- skipping")
+                print(f"[sweep] config {ci}: TIMEOUT waiting for GPU pool to allocate -- skipping")
                 continue
-            print(f"[sweep] ready (PIDs {pids}); settling {args.settle:.0f}s for generation")
+            print(f"[sweep] ready (PIDs {pids}, GPU {used/1e9:.1f} GB allocated + plateaued); "
+                  f"settling {args.settle:.0f}s")
             time.sleep(args.settle)
             pids = tde.gpu_compute_pids() or pids
 
