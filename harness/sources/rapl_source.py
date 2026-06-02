@@ -17,48 +17,58 @@ import os
 from .base import CounterSource
 
 
-def _rapl_package_files() -> list[str]:
+def _rapl_package_dirs() -> list[str]:
     out: list[str] = []
     for d in sorted(glob.glob("/sys/class/powercap/intel-rapl:*")):
-        base = os.path.basename(d)              # intel-rapl:0  (pkg) vs intel-rapl:0:0 (subdomain)
+        base = os.path.basename(d)              # intel-rapl:0 (pkg) vs intel-rapl:0:0 (subdomain)
         if base.count(":") != 1:                # keep only top-level package domains
             continue
-        ej = os.path.join(d, "energy_uj")
-        if os.path.exists(ej):
-            out.append(ej)
+        if os.path.exists(os.path.join(d, "energy_uj")):
+            out.append(d)
     return out
 
 
+def _read_int(path: str) -> int | None:
+    try:
+        return int(open(path).read().strip())
+    except (OSError, ValueError):
+        return None
+
+
 class RaplSource(CounterSource):
+    """RAPL package energy, unwrapped. energy_uj is a fixed-width counter that rolls
+    over at max_energy_range_uj (~65 kJ on AMD); a multi-second op can cross a wrap,
+    making a raw delta negative. We unwrap PER DOMAIN across reads (each read gap is
+    far shorter than the wrap period, so at most one wrap per gap) and return a
+    monotonic cumulative Joule value."""
     name = "cpu_pkg_energy_rapl"
     kind = "energy_counter"
 
     def __init__(self) -> None:
         super().__init__()
-        self._files = _rapl_package_files()
-        readable = False
-        for f in self._files:                   # probe (needs root)
-            try:
-                int(open(f).read().strip())
-                readable = True
-            except OSError:
-                pass
-        self.available = readable and len(self._files) > 0
+        self._dirs = _rapl_package_dirs()
+        self._max = {d: (_read_int(os.path.join(d, "max_energy_range_uj")) or 0)
+                     for d in self._dirs}
+        self._last: dict[str, int] = {}
+        self._off: dict[str, int] = {}
+        readable = any(_read_int(os.path.join(d, "energy_uj")) is not None for d in self._dirs)
+        self.available = readable and len(self._dirs) > 0
         self.detect_note = (
-            f"{len(self._files)} RAPL package domain(s)"
+            f"{len(self._dirs)} RAPL package domain(s), max~{max(self._max.values(), default=0)//10**6}kJ"
             if self.available else "RAPL energy_uj absent or not root-readable"
         )
 
     def read_counter(self) -> float | None:
-        """Cumulative package energy in Joules (sum across sockets)."""
         if not self.available:
             return None
         total_uj = 0
-        try:
-            for f in self._files:
-                total_uj += int(open(f).read().strip())
-        except (OSError, ValueError):
-            return None
-        # NOTE: energy_uj wraps at max_energy_range_uj; ops here are seconds-scale so
-        # a wrap is unlikely, but a long hold could hit it -- revisit if deltas go negative.
+        for d in self._dirs:
+            raw = _read_int(os.path.join(d, "energy_uj"))
+            if raw is None:
+                return None
+            last = self._last.get(d)
+            if last is not None and raw < last and self._max[d]:
+                self._off[d] = self._off.get(d, 0) + self._max[d]   # wrapped since last read
+            self._last[d] = raw
+            total_uj += self._off.get(d, 0) + raw
         return total_uj / 1e6
