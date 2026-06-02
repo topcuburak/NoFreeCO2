@@ -5,11 +5,19 @@
 # vLLM is installed via pip (it pulls a matching torch build). If your server's
 # CUDA/driver needs a specific vLLM/torch, pin `vllm==X.Y.Z` below to match.
 # Gated models/tokenizers (Llama-3.x) need HF_TOKEN exported before running.
+# NOTE on CUDA: vLLM's torch is built against a specific CUDA (check with
+#   python -c "import torch; print(torch.version.cuda)"   # e.g. 13.0
+# vLLM's V1 engine uses torch.compile, which needs nvcc. The torch wheel ships
+# only the CUDA *runtime*, not nvcc. Either run serve.py with --enforce-eager
+# (no nvcc needed), or install a matching toolkit by uncommenting cuda-toolkit
+# below (set the version to match torch.version.cuda) and `export CUDA_HOME=$CONDA_PREFIX`.
 name: socc-bench
 channels:
+  - nvidia
   - conda-forge
 dependencies:
   - python=3.11
+  # - cuda-toolkit=13.0    # uncomment + match torch.version.cuda for compiled/CUDA-graph mode
   - pip
   - pip:
       # --- A2 serving workload ---
