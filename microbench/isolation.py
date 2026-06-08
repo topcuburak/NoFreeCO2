@@ -56,6 +56,44 @@ def pcie_copy_h2d(nbytes: int, gpu: int = 0, iters: int = 50) -> int:
     return nbytes * iters
 
 
+def pcie_copy_rate(nbytes: int, gpu: int = 0, direction: str = "d2h",
+                   target_gbps: float | None = None, chunk_mb: int = 128) -> int:
+    """Move nbytes over PCIe at a CONTROLLED effective bandwidth, by transferring in
+    chunks and pacing (sleep) to hit target_gbps. target_gbps=None/0 -> unthrottled
+    (the hardware ceiling). One chunk buffer is reused, so the alloc is tiny regardless
+    of nbytes -- we measure the cost of moving nbytes of PCIe traffic, not of holding it.
+
+    direction: 'd2h' = HBM->host (suspend/extract leg); 'h2d' = host->HBM (restore leg).
+    Used by characterize_bw_sweep.py to fit E = e_byte*S + P_hold*t (slope vs latency)."""
+    import time
+    import torch
+    dev = torch.device(f"cuda:{gpu}")
+    chunk = (int(chunk_mb) << 20)
+    chunk -= chunk % 2                                   # fp16-align
+    n_elem = chunk // 2
+    nchunks = max(1, nbytes // chunk)
+    host = torch.empty(n_elem, dtype=torch.float16, pin_memory=True)
+    if direction == "h2d":
+        dst = torch.empty(n_elem, dtype=torch.float16, device=dev)
+        do = lambda: dst.copy_(host)                     # H2D
+    else:
+        src = torch.empty(n_elem, dtype=torch.float16, device=dev)
+        do = lambda: host.copy_(src)                     # D2H
+    torch.cuda.synchronize(dev)
+    bps = (target_gbps * 1e9) if target_gbps else None
+    t0 = time.perf_counter()
+    moved = 0
+    for _ in range(nchunks):
+        do()
+        torch.cuda.synchronize(dev)                      # per-chunk so pacing is accurate
+        moved += chunk
+        if bps:                                          # pace to target: sleep if ahead
+            ahead = moved / bps - (time.perf_counter() - t0)
+            if ahead > 0:
+                time.sleep(ahead)
+    return moved
+
+
 def dd_write(path: str, nbytes: int, bs: int = 1 << 26) -> int:
     """O_DIRECT durable write (host->NVMe). Returns bytes written. Device-rate proxy
     for the checkpoint STORE leg (writes zeros; same write-side I/O cost)."""
