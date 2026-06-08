@@ -216,6 +216,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     o = p.add_argument_group("output")
     o.add_argument("--output-json", default=None, help="write throughput metrics here")
+    o.add_argument("--hold-idle", type=float, default=0.0,
+                   help="after generation, keep the process alive (holding the GPU + KV "
+                        "pool) IDLE for this many seconds, issuing NO GPU work. The KV "
+                        "pool is pre-allocated at init so the footprint is unchanged; "
+                        "idling just means no in-flight collectives. Required for "
+                        "checkpointing TP>1: cuda-checkpoint lock-all DEADLOCKS on an "
+                        "in-flight all-reduce, so the dump must hit a collective-free point.")
     return p
 
 
@@ -285,6 +292,33 @@ def main() -> None:
         with open(args.output_json, "w") as f:
             json.dump(metrics, f, indent=2)
         print(f"[a2] metrics -> {args.output_json}")
+
+    # Idle-hold: keep the engine alive holding the GPU + pre-allocated KV pool, but
+    # issue NO further generate() -> no forward pass -> no all-reduce in flight. This
+    # is the collective-free point at which cuda-checkpoint lock-all can succeed for
+    # TP>1 (a busy server is almost never simultaneously outside a collective).
+    if args.hold_idle > 0:
+        used_gb = None
+        try:
+            import pynvml
+            pynvml.nvmlInit()
+            used_gb = sum(pynvml.nvmlDeviceGetMemoryInfo(
+                pynvml.nvmlDeviceGetHandleByIndex(i)).used
+                for i in range(pynvml.nvmlDeviceGetCount())) / 1e9
+        except Exception:
+            pass
+        foot = f"{used_gb:.1f} GB across GPUs" if used_gb else "(GPU pool retained)"
+        print(f"[a2] HOLD-IDLE {args.hold_idle:.0f}s -- engine quiescent, {foot}; "
+              f"NO collectives in flight. Safe to checkpoint NOW (run timed_dump). "
+              f"engine pid {os.getpid()}")
+        held = 0.0
+        try:
+            while held < args.hold_idle:
+                time.sleep(5.0)
+                held += 5.0
+        except KeyboardInterrupt:
+            print("[a2] hold-idle interrupted; exiting")
+        print("[a2] hold-idle done; exiting")
 
 
 if __name__ == "__main__":
