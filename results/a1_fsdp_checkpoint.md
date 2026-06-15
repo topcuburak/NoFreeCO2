@@ -73,6 +73,24 @@ checkpoint pays for the allocator's reserved pool, not the logical tensors.**
   restart whose cost is NOT in the 36.3 s. The two mechanisms trade image size + in-place resume.
 - Rows tagged `tag=a1_fsdp_nvme` in `data/timed_dump.jsonl`. SATA tier: TODO (`--store-out /home/test`).
 
+## Real fine-tune, loss-continuity proof (2026-06-16, Alpaca instruction tuning)
+`fsdp_finetune.py`: genuine instruction tuning (Alpaca, prompt masked, AdamW + cosine LR + grad-accum 4,
+lr 2e-5, batch 1 × seq 512). Loss descends for real (1.35 @ step10 → ~1.0 @ step100), then suspended
+in place at step 100 (destroy PG → full HBM dump to NVMe → hold → restore → reinit → rebind):
+
+| step | 90 | 100 (suspend) | 110 (resumed) | 120 |
+|---|---|---|---|---|
+| loss | 1.0152 | 1.0646 | 1.0906 | 1.0204 |
+
+**Loss is continuous across the dump** — post-resume values stay in the same noise band, no jump/reset.
+Optimizer momentum, LR schedule, and dataloader iterator all survive because cuda-checkpoint evicts only
+GPU state (we `--skip-criu`) so the Python process stays alive through the hold. This is the correctness
+proof for a REAL fine-tune surviving a full 4-GPU HBM dump-to-disk-and-back. Footprint is set by shape
+(batch×seq), not by the data: steady `gpu_alloc` 12.2 GB matches the random-data run's 12.3 GB.
+Caveat: the logged `tok/s` is cumulative, so it drops after resume purely because the ~70 s held during
+the dump averages in as zero-token time — NOT a throughput regression (per-step work unchanged).
+Tagged `a1_finetune_nvme` in `data/timed_dump.jsonl`.
+
 ## Headline finding: the mechanism depends on the WORKLOAD TYPE
 | workload type | temporal mechanism | resumes in place? |
 |---|---|---|
