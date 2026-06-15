@@ -114,7 +114,10 @@ def main() -> None:
     ap.add_argument("--lr", type=float, default=2e-5)
     ap.add_argument("--steps", type=int, default=200, help="optimizer steps")
     ap.add_argument("--warmup-steps", type=int, default=10)
-    ap.add_argument("--suspend-step", type=int, default=100, help="optimizer step to suspend after (-1 = never)")
+    ap.add_argument("--suspend-step", type=int, default=100, help="single suspend step (-1 = never)")
+    ap.add_argument("--suspend-steps", default=None,
+                    help="comma-separated optimizer steps to suspend at, e.g. 40,80,120,160,200 "
+                         "(overrides --suspend-step). Each is a full destroy/dump/reinit/rebind cycle.")
     ap.add_argument("--log-every", type=int, default=10)
     ap.add_argument("--resume-flag", default="/tmp/a1_resume")
     args = ap.parse_args()
@@ -165,7 +168,7 @@ def main() -> None:
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.0)
     sched = get_cosine_schedule_with_warmup(opt, args.warmup_steps, args.steps)
 
-    def suspend_resume(step):
+    def suspend_resume(step, port):
         dist.barrier()
         log(rank, f"[step {step}] reached suspend point; destroying process group (releasing NCCL)...")
         dist.destroy_process_group()
@@ -175,13 +178,28 @@ def main() -> None:
                   f"ready for cuda-checkpoint. (touch {args.resume_flag} to reinit+continue)")
         while not os.path.exists(args.resume_flag):
             time.sleep(1)
+        try: os.remove(f"/tmp/a1_destroyed.{rank}")          # signal this rank consumed the resume
+        except OSError: pass
         t0 = time.time()
-        store = dist.TCPStore(master_addr, base_port + 1, world, is_master=(rank == 0),
+        store = dist.TCPStore(master_addr, port, world, is_master=(rank == 0),  # fresh port per round
                               timeout=datetime.timedelta(seconds=180))
         dist.init_process_group("nccl", store=store, rank=rank, world_size=world)
-        dist.barrier()
+        dist.barrier()                                       # all ranks joined -> safe to clear flag
         rebind_fsdp_pg(model, dist.group.WORLD, rank)
+        if rank == 0:
+            try: os.remove(args.resume_flag)                 # clear for the next round
+            except OSError: pass
         log(rank, f"PG RE-INIT (fresh store) in {time.time()-t0:.2f}s -- continuing fine-tuning")
+
+    if args.suspend_steps:
+        suspend_set = sorted(int(s) for s in args.suspend_steps.split(",") if s.strip())
+    elif args.suspend_step is not None and args.suspend_step >= 0:
+        suspend_set = [args.suspend_step]
+    else:
+        suspend_set = []
+    suspend_port = {s: base_port + 1 + i for i, s in enumerate(suspend_set)}  # unique store port each
+    if rank == 0 and suspend_set:
+        log(0, f"will suspend/dump/resume at optimizer steps {suspend_set}")
 
     model.train()
     step = 0                                              # optimizer steps taken
@@ -213,8 +231,8 @@ def main() -> None:
                     log(0, f"step {step:4d}/{args.steps}  loss {avg:.4f}  lr {sched.get_last_lr()[0]:.2e}  "
                            f"{tps:.0f} tok/s  gpu_alloc {used:.1f} GB")
                     accum_loss = 0.0
-                if 0 <= args.suspend_step == step:
-                    suspend_resume(step)
+                if step in suspend_port:
+                    suspend_resume(step, suspend_port[step])
                 if step >= args.steps:
                     done = True; break
         epoch += 1
