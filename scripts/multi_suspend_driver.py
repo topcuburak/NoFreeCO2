@@ -26,6 +26,7 @@ import argparse
 import os
 import sys
 import time
+import traceback
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO = os.path.dirname(_HERE)
@@ -112,9 +113,11 @@ def main() -> None:
                                     os.path.join(_REPO, "dumps"), mark, args.baseline, False,
                                     multiproc=True, criu_root=None, hold_seconds=args.hold_seconds,
                                     skip_criu=True, store=True, store_out=args.store_out, tag=args.tag)
-            except Exception as e:
-                print(f"[driver] round {i+1} dump FAILED: {type(e).__name__}: {e}")
-            open(args.resume_flag, "w").close()             # release training
+            except Exception:
+                print(f"[driver] round {i+1} (step {label}) dump FAILED -- full traceback:")
+                traceback.print_exc()
+                print(f"[driver] cc states now: {td._states(pf['cuda_checkpoint'], pids)}")
+            open(args.resume_flag, "w").close()             # release training (GPU is restored by now)
             print(f"[driver] touched {args.resume_flag}; waiting for training to resume ...")
             wait_until(lambda: none_held(args.world, args.destroyed_prefix), args.wait_timeout)
         print(f"\n[driver] done. {rounds} rounds -> data/timed_dump.jsonl (tag {args.tag})")

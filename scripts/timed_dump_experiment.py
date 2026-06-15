@@ -106,99 +106,111 @@ def dump_and_resume(tele, cc_bin, criu_bin, pids, out_dir, mark_min, baseline, k
     """
     gpu_before = td.gpu_used_bytes()
     mark_dir = os.path.join(out_dir, f"mark_{mark_min}min")
+    out = {"suspend": None, "criu": None, "store": None, "load": None, "resume": None}
 
-    # phase 1: suspend (HBM -> host), pauses inference -- the footprint cuda-checkpoint dumps
-    rec_s = measure_operation(
-        tele, workload="timed_dump", operation="cuda_checkpoint",
-        state_bytes=gpu_before, baseline_seconds=baseline,
-        op=lambda: td.cuda_suspend(cc_bin, pids, multiproc),
-        config={"mark_min": mark_min, "domain": "accelerator", "phase": "suspend",
-                "multiproc": multiproc})
+    def _emit(rec):                                  # finalize + write IMMEDIATELY (survive failures)
+        rec.extra["mark_min"] = mark_min
+        if tag:
+            rec.config["tag"] = tag
+        print_record(rec)
+        write_record(rec, "timed_dump")
+
+    # phase 1: suspend (HBM -> host). If THIS fails (e.g. cuda-checkpoint can't checkpoint
+    # a live IPC handle), the suspend may be PARTIAL -> best-effort recover to running, then
+    # re-raise so the caller records nothing and (GPU intact) can safely continue training.
+    try:
+        rec_s = measure_operation(
+            tele, workload="timed_dump", operation="cuda_checkpoint",
+            state_bytes=gpu_before, baseline_seconds=baseline,
+            op=lambda: td.cuda_suspend(cc_bin, pids, multiproc),
+            config={"mark_min": mark_min, "domain": "accelerator", "phase": "suspend",
+                    "multiproc": multiproc})
+    except Exception as e:
+        print(f"[timed] mark {mark_min}: SUSPEND failed ({type(e).__name__}: {e}); "
+              f"recovering processes to running", flush=True)
+        td.cuda_recover(cc_bin, pids)
+        raise
     gpu_after = td.gpu_used_bytes()
     rec_s.extra["gpu_freed_bytes"] = gpu_before - gpu_after
+    out["suspend"] = rec_s
+    _emit(rec_s)
 
-    # phase 2: persist (host -> NVMe) -- optional (criu blocked by io_uring on ford)
-    rec_c = None
-    if not skip_criu:
-        rss = td.rss_bytes(pids)
-        rec_c = measure_operation(
-            tele, workload="timed_dump", operation="criu_dump",
-            state_bytes=rss, baseline_seconds=baseline,
-            op=lambda: td.op_criu_dump(criu_bin, pids, mark_dir, leave_running=True,
-                                       criu_root=criu_root),
-            config={"mark_min": mark_min, "domain": "host"})
-        rec_c.extra["image_bytes"] = int(rec_c.extra.get("op_result") or 0)
-        if not keep_images:
-            shutil.rmtree(mark_dir, ignore_errors=True)
+    # Once suspended, the GPU is EVICTED. Guarantee cuda_resume runs no matter what happens
+    # in store/load/hold (finally) -- else training would reinit onto freed memory and corrupt.
+    try:
+        # phase 2: persist (host -> NVMe) -- optional (criu blocked by io_uring on ford)
+        if not skip_criu:
+            rss = td.rss_bytes(pids)
+            rec_c = measure_operation(
+                tele, workload="timed_dump", operation="criu_dump",
+                state_bytes=rss, baseline_seconds=baseline,
+                op=lambda: td.op_criu_dump(criu_bin, pids, mark_dir, leave_running=True,
+                                           criu_root=criu_root),
+                config={"mark_min": mark_min, "domain": "host"})
+            rec_c.extra["image_bytes"] = int(rec_c.extra.get("op_result") or 0)
+            if not keep_images:
+                shutil.rmtree(mark_dir, ignore_errors=True)
+            out["criu"] = rec_c
+            _emit(rec_c)
 
-    # phase 2b: STORE (host DRAM -> NVMe) -- footprint-sized O_DIRECT proxy write
-    rec_store = None
-    spath = None
-    if store:
-        os.makedirs(store_out, exist_ok=True)
-        spath = os.path.join(store_out, f"socc_store_{mark_min}min.bin")
-        rec_store = measure_operation(
-            tele, workload="timed_dump", operation="store",
+        # phase 2b: STORE (host DRAM -> NVMe) -- footprint-sized O_DIRECT proxy write
+        spath = None
+        if store:
+            os.makedirs(store_out, exist_ok=True)
+            spath = os.path.join(store_out, f"socc_store_{mark_min}min.bin")
+            rec_store = measure_operation(
+                tele, workload="timed_dump", operation="store",
+                state_bytes=gpu_before, baseline_seconds=baseline,
+                op=lambda: dd_write(spath, gpu_before),
+                config={"mark_min": mark_min, "domain": "host", "phase": "store", "out": store_out})
+            out["store"] = rec_store
+            _emit(rec_store)
+
+        # optional hold: observe checkpointed state; capture idle-holding power E_idle.
+        if hold_seconds > 0:
+            print(f"[timed] HOLDING checkpointed/suspended for {hold_seconds:.0f}s", flush=True)
+            gpu_idle = td.gpu_used_bytes()
+            rec_h = measure_operation(
+                tele, workload="timed_dump", operation="idle_hold",
+                state_bytes=gpu_idle, baseline_seconds=min(baseline, 2.0),
+                op=lambda: time.sleep(hold_seconds),
+                config={"mark_min": mark_min, "domain": "host", "phase": "hold",
+                        "hold_seconds": hold_seconds})
+            _emit(rec_h)
+
+        # phase 3b: LOAD (NVMe -> host DRAM) -- cold read back before resume
+        if store:
+            drop_caches()
+            rec_load = measure_operation(
+                tele, workload="timed_dump", operation="load",
+                state_bytes=gpu_before, baseline_seconds=baseline,
+                op=lambda: dd_read(spath, gpu_before),
+                config={"mark_min": mark_min, "domain": "host", "phase": "load"})
+            try: os.remove(spath)
+            except OSError: pass
+            out["load"] = rec_load
+            _emit(rec_load)
+    except Exception as e:
+        print(f"[timed] mark {mark_min}: store/load FAILED ({type(e).__name__}: {e}); "
+              f"restoring GPU anyway", flush=True)
+    finally:
+        # phase 3: resume (host -> HBM) -- ALWAYS, so the GPU is never left evicted
+        rec_r = measure_operation(
+            tele, workload="timed_dump", operation="cuda_restore",
             state_bytes=gpu_before, baseline_seconds=baseline,
-            op=lambda: dd_write(spath, gpu_before),
-            config={"mark_min": mark_min, "domain": "host", "phase": "store", "out": store_out})
+            op=lambda: td.cuda_resume(cc_bin, pids, multiproc),
+            config={"mark_min": mark_min, "domain": "accelerator", "phase": "resume",
+                    "multiproc": multiproc})
+        out["resume"] = rec_r
+        _emit(rec_r)
 
-    # optional hold: observe the checkpointed state (nvidia-smi shows GPU freed;
-    # image at mark_dir if --keep-images) and capture idle-holding power E_idle.
-    if hold_seconds > 0:
-        img_note = mark_dir if keep_images else "(image deleted; use --keep-images to inspect)"
-        print(f"[timed] HOLDING checkpointed/suspended for {hold_seconds:.0f}s -- "
-              f"observe `nvidia-smi` (GPU freed) and {img_note}")
-        gpu_idle = td.gpu_used_bytes()
-        rec_h = measure_operation(
-            tele, workload="timed_dump", operation="idle_hold",
-            state_bytes=gpu_idle, baseline_seconds=min(baseline, 2.0),
-            op=lambda: time.sleep(hold_seconds),
-            config={"mark_min": mark_min, "domain": "host", "phase": "hold",
-                    "hold_seconds": hold_seconds})
-        rec_h.extra["mark_min"] = mark_min
-        if tag:
-            rec_h.config["tag"] = tag
-        write_record(rec_h, "timed_dump")
-
-    # phase 3b: LOAD (NVMe -> host DRAM) -- cold read back before resume
-    rec_load = None
-    if store:
-        drop_caches()
-        rec_load = measure_operation(
-            tele, workload="timed_dump", operation="load",
-            state_bytes=gpu_before, baseline_seconds=baseline,
-            op=lambda: dd_read(spath, gpu_before),
-            config={"mark_min": mark_min, "domain": "host", "phase": "load"})
-        try:
-            os.remove(spath)
-        except OSError:
-            pass
-
-    # phase 3: resume (host -> HBM), resumes inference
-    rec_r = measure_operation(
-        tele, workload="timed_dump", operation="cuda_restore",
-        state_bytes=gpu_before, baseline_seconds=baseline,
-        op=lambda: td.cuda_resume(cc_bin, pids, multiproc),
-        config={"mark_min": mark_min, "domain": "accelerator", "phase": "resume",
-                "multiproc": multiproc})
-
-    recs = ([rec_s] + ([rec_c] if rec_c else []) + ([rec_store] if rec_store else [])
-            + ([rec_load] if rec_load else []) + [rec_r])
-    for r in recs:
-        r.extra["mark_min"] = mark_min
-        if tag:
-            r.config["tag"] = tag
-        print_record(r)
-        write_record(r, "timed_dump")
     footprint_gb = rec_s.extra.get("gpu_freed_bytes", 0) / 1e9
-    store_s = rec_store.latency_s if rec_store else (rec_c.latency_s if rec_c else 0.0)
-    load_s = rec_load.latency_s if rec_load else 0.0
+    store_s = out["store"].latency_s if out["store"] else (out["criu"].latency_s if out["criu"] else 0.0)
+    load_s = out["load"].latency_s if out["load"] else 0.0
     print(f"[timed] mark {mark_min}min: FOOTPRINT {footprint_gb:.1f} GB | "
           f"suspend {rec_s.latency_s:.2f}s + store {store_s:.2f}s + load {load_s:.2f}s + "
-          f"resume {rec_r.latency_s:.2f}s")
-    return {"suspend": rec_s, "criu": rec_c, "store": rec_store,
-            "load": rec_load, "resume": rec_r}
+          f"resume {out['resume'].latency_s:.2f}s")
+    return out
 
 
 def main() -> None:

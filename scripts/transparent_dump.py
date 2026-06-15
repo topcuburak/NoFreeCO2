@@ -143,9 +143,30 @@ def host_free_bytes() -> int:
 # --------------------------------------------------------------------------- #
 # the two measured operations
 # --------------------------------------------------------------------------- #
-def _cc(cc_bin: str, pid: int, *cc_args: str) -> None:
-    subprocess.run([cc_bin, *cc_args, "--pid", str(pid)],
-                   check=True, capture_output=True, text=True)
+def _cc(cc_bin: str, pid: int, *cc_args: str) -> str:
+    """Run one cuda-checkpoint action; on failure raise RuntimeError that SURFACES the
+    tool's stderr (the real reason, e.g. CUDA_ERROR_OPERATING_SYSTEM 304 on a live IPC
+    handle) instead of a bare 'non-zero exit status'."""
+    r = subprocess.run([cc_bin, *cc_args, "--pid", str(pid)], capture_output=True, text=True)
+    if r.returncode != 0:
+        msg = (r.stderr or r.stdout or "").strip()
+        raise RuntimeError(f"cuda-checkpoint {' '.join(cc_args)} --pid {pid} "
+                           f"failed (rc={r.returncode}): {msg}")
+    return (r.stdout or "").strip()
+
+
+def cc_get_state(cc_bin: str, pid: int) -> str:
+    """Best-effort process checkpoint state (running/locked/checkpointed). For diagnosis."""
+    try:
+        r = subprocess.run([cc_bin, "--get-state", "--pid", str(pid)],
+                           capture_output=True, text=True)
+        return (r.stdout or r.stderr or "").strip() or "?"
+    except Exception as e:
+        return f"<get-state err: {e}>"
+
+
+def _states(cc_bin, pids):
+    return " ".join(f"{p}:{cc_get_state(cc_bin, p)}" for p in pids)
 
 
 def cuda_suspend(cc_bin: str, pids: list[int], multiproc: bool = False) -> int:
@@ -157,10 +178,13 @@ def cuda_suspend(cc_bin: str, pids: list[int], multiproc: bool = False) -> int:
     while others run mid-collective would deadlock -- hence lock-all-then-ckpt-all.
     """
     if multiproc:
+        print(f"[cc] suspend: pre-state {_states(cc_bin, pids)}", flush=True)
         for p in pids:
             _cc(cc_bin, p, "--action", "lock")
+        print(f"[cc] suspend: locked   {_states(cc_bin, pids)}", flush=True)
         for p in pids:
             _cc(cc_bin, p, "--action", "checkpoint")
+        print(f"[cc] suspend: ckpted   {_states(cc_bin, pids)}", flush=True)
     else:
         for p in pids:
             _cc(cc_bin, p, "--toggle")
@@ -175,10 +199,24 @@ def cuda_resume(cc_bin: str, pids: list[int], multiproc: bool = False) -> int:
             _cc(cc_bin, p, "--action", "restore")
         for p in pids:
             _cc(cc_bin, p, "--action", "unlock")
+        print(f"[cc] resume:  post-state {_states(cc_bin, pids)}", flush=True)
     else:
         for p in reversed(pids):
             _cc(cc_bin, p, "--toggle")
     return len(pids)
+
+
+def cuda_recover(cc_bin: str, pids: list[int]) -> None:
+    """Best-effort: bring processes back to running after a partial/failed suspend
+    (some may be locked, some checkpointed). restore then unlock each, ignoring errors
+    for the ones not in that state. Leaves everything as close to 'running' as possible."""
+    for p in pids:
+        for act in ("restore", "unlock"):
+            try:
+                _cc(cc_bin, p, "--action", act)
+            except Exception:
+                pass
+    print(f"[cc] recover: post-state {_states(cc_bin, pids)}", flush=True)
 
 
 # kept for back-compat (TP=1 single-phase callers)
