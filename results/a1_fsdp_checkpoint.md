@@ -73,6 +73,28 @@ checkpoint pays for the allocator's reserved pool, not the logical tensors.**
   restart whose cost is NOT in the 36.3 s. The two mechanisms trade image size + in-place resume.
 - Rows tagged `tag=a1_fsdp_nvme` in `data/timed_dump.jsonl`. SATA tier: TODO (`--store-out /home/test`).
 
+### Random-data footprint generator vs REAL fine-tune (both transparent, NVMe)
+The real Alpaca fine-tune (`fsdp_finetune.py`, 100 steps, fp32 reduce + grad-accum 4 + grad clip) dumps
+**MORE** and costs **super-linearly** more than the random 6-step run, though steady alloc is identical (12.2 GB):
+
+| | random (fsdp_train, 6 steps) | real fine-tune (Alpaca, 100 steps) |
+|---|---|---|
+| footprint | 127.7 GB | **150.3 GB** (37 GB/GPU, near 40 GB cap) |
+| suspend HBM→host | 23.60 s / 5.41 GB/s / 10.88 kJ | **54.93 s / 2.74 GB/s / 24.93 kJ** |
+| store host→NVMe | 20.36 s / 7.58 kJ | 25.22 s / 9.63 kJ |
+| load NVMe→host | 9.98 s / 3.68 kJ | 11.75 s / 4.43 kJ |
+| resume host→HBM | 7.84 s / 16.29 GB/s / 3.73 kJ | **22.66 s / 6.63 GB/s / 10.12 kJ** |
+| round-trip | 61.8 s / 25.9 kJ | **114.6 s / 49.1 kJ** |
+| J/GB (round-trip, abs) | 202.6 | **326.8** |
+
+**Footprint +18% but round-trip +85% and energy +90%.** Disk legs scaled with bytes; the GPU-side
+cuda-checkpoint legs (suspend/resume) got ~2× slower PER GB. Driver: real training fragments device
+memory (fp32 grad-comm buffers, grad-accum, clip temporaries) into more/smaller allocations, and
+cuda-checkpoint walks every allocation -> lower effective GB/s. This is the **allocation-structure
+effect** (cf. the `--chunks` probe): transparent-checkpoint cost depends on allocation COUNT/layout,
+not just total bytes. So the transparency tax for REAL training is 3.1× the DCP logical state in bytes
+(150.3 vs 48.2 GB) AND a degraded per-GB rate. Real-finetune rows tagged `a1_finetune_nvme`.
+
 ## Real fine-tune, loss-continuity proof (2026-06-16, Alpaca instruction tuning)
 `fsdp_finetune.py`: genuine instruction tuning (Alpaca, prompt masked, AdamW + cosine LR + grad-accum 4,
 lr 2e-5, batch 1 × seq 512). Loss descends for real (1.35 @ step10 → ~1.0 @ step100), then suspended
