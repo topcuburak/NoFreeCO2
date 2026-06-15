@@ -94,9 +94,31 @@ def pid_gpu_indices(pids) -> list[int] | None:
     return sorted(idx) or None
 
 
+# ---- MODELED energy for the two domains ford has no hardware power telemetry for ----
+# (GPU board incl. HBM is measured via NVML; CPU package via RAPL. DRAM DIMMs have no RAPL
+# domain on this EPYC; the NVMe/SATA drive has only a byte counter.) Kept SEPARATE from the
+# measured "TOTAL absolute" -- never folded into it -- and reported as a FULL total.
+#  DRAM:  w_dram_per_gb * resident_GB * t_leg. The 150 GB host staging buffer is resident and
+#         accessed every leg. 0.3 W/GB ~ active server DDR4 (refresh ~0.1 + access). Range 0.1-0.4.
+#  DRIVE: P_drive * t_leg over the DISK legs only (store/load). From storage_size_sweep.md:
+#         NVMe RAID-0 = 50 W (25 W x2), SATA = 3 W active. (suspend/resume touch no disk -> 0.)
+DRAM_W_PER_GB_DEFAULT = 0.3
+DRIVE_W_DEFAULT = 50.0          # NVMe RAID-0; pass --drive-w 3 for SATA
+
+
+def model_aux_energy(phase, footprint_bytes, latency_s, dram_w_per_gb, drive_w):
+    """MODELED (dram_j, drive_j) for one leg. DRAM on every leg (staging buffer resident/
+    accessed); drive only on the disk legs."""
+    s_gb = (footprint_bytes or 0) / 1e9
+    dram_j = dram_w_per_gb * s_gb * latency_s
+    drive_j = drive_w * latency_s if phase in ("store", "load") else 0.0
+    return dram_j, drive_j
+
+
 def dump_and_resume(tele, cc_bin, criu_bin, pids, out_dir, mark_min, baseline, keep_images,
                     multiproc=False, criu_root=None, hold_seconds=0.0, skip_criu=False,
-                    store=False, store_out=None, tag=None):
+                    store=False, store_out=None, tag=None,
+                    dram_w_per_gb=DRAM_W_PER_GB_DEFAULT, drive_w=DRIVE_W_DEFAULT):
     """One full cycle, measured records tagged by mark:
     suspend (HBM->host) -> [store (host->NVMe)] -> [hold] -> [load (NVMe->host)] -> resume.
 
@@ -112,7 +134,15 @@ def dump_and_resume(tele, cc_bin, criu_bin, pids, out_dir, mark_min, baseline, k
         rec.extra["mark_min"] = mark_min
         if tag:
             rec.config["tag"] = tag
+        phase = rec.config.get("phase", "")
+        dram_j, drive_j = model_aux_energy(phase, gpu_before, rec.latency_s, dram_w_per_gb, drive_w)
+        meas_abs = sum(s.energy_abs_j or 0.0 for s in rec.sources)   # GPU+CPU measured
+        rec.extra.update(measured_abs_j=round(meas_abs, 1), dram_model_j=round(dram_j, 1),
+                         drive_model_j=round(drive_j, 1), full_total_j=round(meas_abs + dram_j + drive_j, 1),
+                         dram_w_per_gb=dram_w_per_gb, drive_w=drive_w)
         print_record(rec)
+        print(f"  modeled: DRAM {dram_j:.0f} J + drive {drive_j:.0f} J  |  "
+              f"FULL (meas GPU+CPU + modeled DRAM+drive): {meas_abs + dram_j + drive_j:.0f} J", flush=True)
         write_record(rec, "timed_dump")
 
     # phase 1: suspend (HBM -> host). If THIS fails (e.g. cuda-checkpoint can't checkpoint
@@ -194,6 +224,10 @@ def dump_and_resume(tele, cc_bin, criu_bin, pids, out_dir, mark_min, baseline, k
         print(f"[timed] mark {mark_min}: store/load FAILED ({type(e).__name__}: {e}); "
               f"restoring GPU anyway", flush=True)
     finally:
+        # clear page cache so the store/load proxy's 150 GB doesn't keep the cuda-checkpoint
+        # host staging buffer paged out -> otherwise resume faults it all back in (the 84 s outlier)
+        if store:
+            drop_caches()
         # phase 3: resume (host -> HBM) -- ALWAYS, so the GPU is never left evicted
         rec_r = measure_operation(
             tele, workload="timed_dump", operation="cuda_restore",
@@ -242,7 +276,15 @@ def main() -> None:
     ap.add_argument("--tag", default=None,
                     help="label written into each record's config (e.g. a1_fsdp_nvme) to separate "
                          "this run from other timed_dump rows in data/timed_dump.jsonl")
+    ap.add_argument("--dram-w-per-gb", type=float, default=DRAM_W_PER_GB_DEFAULT,
+                    help="MODELED DRAM power per GB resident (no DRAM RAPL on this EPYC)")
+    ap.add_argument("--drive-w", type=float, default=DRIVE_W_DEFAULT,
+                    help="MODELED drive active power for the store/load legs (NVMe 50, SATA 3)")
+    ap.add_argument("--verbose-cc", action="store_true",
+                    help="log cuda-checkpoint state transitions (adds get-state subprocesses "
+                         "INSIDE the timed op -> only for debugging, not clean measurement)")
     args = ap.parse_args()
+    td.VERBOSE = args.verbose_cc
 
     pf = td.preflight(args)
     print(f"[timed] cuda-checkpoint={pf['cuda_checkpoint']} criu={pf['criu']} euid={pf['euid']}")
@@ -274,7 +316,8 @@ def main() -> None:
                                 args.out, m, args.baseline, args.keep_images,
                                 multiproc=args.multiproc, criu_root=args.criu_root,
                                 hold_seconds=args.hold_seconds, skip_criu=args.skip_criu,
-                                store=args.store, store_out=args.store_out, tag=args.tag)
+                                store=args.store, store_out=args.store_out, tag=args.tag,
+                                dram_w_per_gb=args.dram_w_per_gb, drive_w=args.drive_w)
             except Exception as e:
                 print(f"[timed] mark {m}min FAILED: {type(e).__name__}: {e}")
                 print(f"[timed] (if criu errored, paste it -- likely needs extra flags)")

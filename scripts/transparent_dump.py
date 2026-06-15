@@ -47,6 +47,11 @@ try:
 except Exception:
     _HAVE_NVML = False
 
+# When True, cuda_suspend/cuda_resume print per-process state transitions for diagnosis.
+# OFF by default: each --get-state spawns a cuda-checkpoint subprocess INSIDE the timed op,
+# inflating measured suspend/resume latency. Enable only when debugging (--verbose-cc).
+VERBOSE = False
+
 
 # --------------------------------------------------------------------------- #
 # preflight + helpers
@@ -178,13 +183,16 @@ def cuda_suspend(cc_bin: str, pids: list[int], multiproc: bool = False) -> int:
     while others run mid-collective would deadlock -- hence lock-all-then-ckpt-all.
     """
     if multiproc:
-        print(f"[cc] suspend: pre-state {_states(cc_bin, pids)}", flush=True)
+        if VERBOSE:
+            print(f"[cc] suspend: pre-state {_states(cc_bin, pids)}", flush=True)
         for p in pids:
             _cc(cc_bin, p, "--action", "lock")
-        print(f"[cc] suspend: locked   {_states(cc_bin, pids)}", flush=True)
+        if VERBOSE:
+            print(f"[cc] suspend: locked   {_states(cc_bin, pids)}", flush=True)
         for p in pids:
             _cc(cc_bin, p, "--action", "checkpoint")
-        print(f"[cc] suspend: ckpted   {_states(cc_bin, pids)}", flush=True)
+        if VERBOSE:
+            print(f"[cc] suspend: ckpted   {_states(cc_bin, pids)}", flush=True)
     else:
         for p in pids:
             _cc(cc_bin, p, "--toggle")
@@ -199,7 +207,8 @@ def cuda_resume(cc_bin: str, pids: list[int], multiproc: bool = False) -> int:
             _cc(cc_bin, p, "--action", "restore")
         for p in pids:
             _cc(cc_bin, p, "--action", "unlock")
-        print(f"[cc] resume:  post-state {_states(cc_bin, pids)}", flush=True)
+        if VERBOSE:
+            print(f"[cc] resume:  post-state {_states(cc_bin, pids)}", flush=True)
     else:
         for p in reversed(pids):
             _cc(cc_bin, p, "--toggle")

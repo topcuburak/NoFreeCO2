@@ -70,9 +70,20 @@ def main() -> None:
     ap.add_argument("--destroyed-prefix", default="/tmp/a1_destroyed.")
     ap.add_argument("--wait-timeout", type=float, default=3600.0,
                     help="max wait for the next held state (covers training between suspends)")
+    ap.add_argument("--dram-w-per-gb", type=float, default=tde.DRAM_W_PER_GB_DEFAULT,
+                    help="MODELED DRAM power per GB resident (no DRAM RAPL on this EPYC)")
+    ap.add_argument("--drive-w", type=float, default=None,
+                    help="MODELED drive active power, store/load legs (default: auto by --store-out "
+                         "-- NVMe 50, SATA 3)")
+    ap.add_argument("--verbose-cc", action="store_true", help="log cuda-checkpoint state transitions")
     ap.add_argument("--cc-bin", default=None)
     ap.add_argument("--criu-bin", default=None)
     args = ap.parse_args()
+    td.VERBOSE = args.verbose_cc
+    if args.drive_w is None:                             # auto-pick by tier of the store path
+        args.drive_w = 3.0 if "home" in (args.store_out or "") else tde.DRIVE_W_DEFAULT
+    print(f"[driver] modeled: DRAM {args.dram_w_per_gb} W/GB, drive {args.drive_w} W "
+          f"(store_out={args.store_out})")
 
     pf = td.preflight(args)
     print(f"[driver] cuda-checkpoint={pf['cuda_checkpoint']} euid={pf['euid']}")
@@ -112,7 +123,8 @@ def main() -> None:
                 tde.dump_and_resume(tele, pf["cuda_checkpoint"], pf["criu"], pids,
                                     os.path.join(_REPO, "dumps"), mark, args.baseline, False,
                                     multiproc=True, criu_root=None, hold_seconds=args.hold_seconds,
-                                    skip_criu=True, store=True, store_out=args.store_out, tag=args.tag)
+                                    skip_criu=True, store=True, store_out=args.store_out, tag=args.tag,
+                                    dram_w_per_gb=args.dram_w_per_gb, drive_w=args.drive_w)
             except Exception:
                 print(f"[driver] round {i+1} (step {label}) dump FAILED -- full traceback:")
                 traceback.print_exc()
