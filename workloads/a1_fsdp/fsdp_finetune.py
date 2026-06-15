@@ -120,6 +120,8 @@ def main() -> None:
                          "(overrides --suspend-step). Each is a full destroy/dump/reinit/rebind cycle.")
     ap.add_argument("--log-every", type=int, default=10)
     ap.add_argument("--resume-flag", default="/tmp/a1_resume")
+    ap.add_argument("--destroyed-prefix", default="/tmp/a1_destroyed.",
+                    help="per-rank held-marker prefix; the driver deletes <prefix><rank> to resume")
     args = ap.parse_args()
 
     import torch
@@ -169,25 +171,29 @@ def main() -> None:
     sched = get_cosine_schedule_with_warmup(opt, args.warmup_steps, args.steps)
 
     def suspend_resume(step, port):
+        # Marker-based handshake: this rank writes its OWN private marker and spins until the
+        # DRIVER deletes it (driver = sole remover -> no shared-flag TOCTOU race). Manual fallback:
+        # touching --resume-flag also releases. The driver must NOT proceed until the dump is done.
+        marker = f"{args.destroyed_prefix}{rank}"
         dist.barrier()
         log(rank, f"[step {step}] reached suspend point; destroying process group (releasing NCCL)...")
         dist.destroy_process_group()
         torch.cuda.synchronize(dev)
-        open(f"/tmp/a1_destroyed.{rank}", "w").close()
+        open(marker, "w").close()
         log(rank, f"PG DESTROYED -- PID={os.getpid()} holding FSDP state on cuda:{local}, "
-                  f"ready for cuda-checkpoint. (touch {args.resume_flag} to reinit+continue)")
-        while not os.path.exists(args.resume_flag):
-            time.sleep(1)
-        try: os.remove(f"/tmp/a1_destroyed.{rank}")          # signal this rank consumed the resume
+                  f"ready for cuda-checkpoint. (driver clears {marker}, or touch {args.resume_flag})")
+        while os.path.exists(marker) and not os.path.exists(args.resume_flag):
+            time.sleep(0.5)
+        try: os.remove(marker)                               # idempotent (driver may have removed it)
         except OSError: pass
         t0 = time.time()
         store = dist.TCPStore(master_addr, port, world, is_master=(rank == 0),  # fresh port per round
                               timeout=datetime.timedelta(seconds=180))
         dist.init_process_group("nccl", store=store, rank=rank, world_size=world)
-        dist.barrier()                                       # all ranks joined -> safe to clear flag
+        dist.barrier()
         rebind_fsdp_pg(model, dist.group.WORLD, rank)
-        if rank == 0:
-            try: os.remove(args.resume_flag)                 # clear for the next round
+        if rank == 0 and os.path.exists(args.resume_flag):   # manual-mode cleanup only
+            try: os.remove(args.resume_flag)
             except OSError: pass
         log(rank, f"PG RE-INIT (fresh store) in {time.time()-t0:.2f}s -- continuing fine-tuning")
 

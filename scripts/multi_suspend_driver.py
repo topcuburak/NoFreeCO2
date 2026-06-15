@@ -117,9 +117,13 @@ def main() -> None:
                 print(f"[driver] round {i+1} (step {label}) dump FAILED -- full traceback:")
                 traceback.print_exc()
                 print(f"[driver] cc states now: {td._states(pf['cuda_checkpoint'], pids)}")
-            open(args.resume_flag, "w").close()             # release training (GPU is restored by now)
-            print(f"[driver] touched {args.resume_flag}; waiting for training to resume ...")
-            wait_until(lambda: none_held(args.world, args.destroyed_prefix), args.wait_timeout)
+            # release training by deleting each rank's held-marker (driver = sole remover -> no race).
+            # GPU is already restored (dump_and_resume guarantees cuda_resume in its finally).
+            for r in range(args.world):
+                try: os.remove(f"{args.destroyed_prefix}{r}")
+                except OSError: pass
+            print(f"[driver] cleared held-markers; training resuming. round {i+1} done.")
+            wait_until(lambda: none_held(args.world, args.destroyed_prefix), 30)  # confirm cleared
         print(f"\n[driver] done. {rounds} rounds -> data/timed_dump.jsonl (tag {args.tag})")
     finally:
         tele.stop()
