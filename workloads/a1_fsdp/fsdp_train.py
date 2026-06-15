@@ -34,6 +34,36 @@ def log(rank, msg):
     print(f"[A1 rank{rank}] {msg}", flush=True)
 
 
+def rebind_fsdp_pg(model, new_pg, rank):
+    """After destroy/reinit, FSDP still references the ABORTED communicator (it caches
+    the process group per wrapped layer + per flat-param handle). Re-point every cached
+    reference at the freshly-initialized default group so the next all-gather uses the
+    live comm instead of the aborted one. Defensive across FSDP attribute layouts."""
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+    n_mod = n_handle = 0
+    for m in FSDP.fsdp_modules(model):
+        targets = [m, getattr(m, "_fsdp_state", None)]
+        for obj in targets:
+            if obj is not None and hasattr(obj, "process_group"):
+                obj.process_group = new_pg
+                n_mod += 1
+        handles = []
+        for attr in ("_handle", "_handles"):
+            h = getattr(m, attr, None) or (getattr(m, "_fsdp_state", None)
+                                           and getattr(m._fsdp_state, attr, None))
+            if h is None:
+                continue
+            handles.extend(h if isinstance(h, (list, tuple)) else [h])
+        for h in handles:
+            if hasattr(h, "process_group"):
+                h.process_group = new_pg; n_handle += 1
+            if hasattr(h, "_process_group"):
+                h._process_group = new_pg
+    if rank == 0:
+        log(0, f"rebind_fsdp_pg: re-pointed {n_mod} module(s) + {n_handle} handle(s) "
+               f"to the fresh process group")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="meta-llama/Llama-3.1-8B")
@@ -108,6 +138,7 @@ def main() -> None:
                               timeout=datetime.timedelta(seconds=180))
         dist.init_process_group("nccl", store=store, rank=rank, world_size=world)
         dist.barrier()
+        rebind_fsdp_pg(model, dist.group.WORLD, rank)        # re-point FSDP at the live comm
         log(rank, f"PG RE-INIT (fresh store) in {time.time()-t0:.2f}s -- continuing training")
         for step in range(args.suspend_step, args.steps):   # CONTINUE -- validates correctness
             train_step(step)
