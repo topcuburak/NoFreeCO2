@@ -48,6 +48,31 @@ state → disk, reload into a fresh process. Measured (NVMe `/var/data`):
   write 5.8 (**2.3×**); load 2.75 vs raw read 12.7 (**4.6×**) — gather/serialize/deserialize overhead
   on top of the disk I/O. (SATA tier: TODO — expect save ~100 s+ at 0.48 GB/s.)
 
+## Transparent dump cost — MEASURED (2026-06-16, NVMe `/var/data`, 4× A100)
+Held the 4 FSDP ranks (PG destroyed), then ran `timed_dump_experiment.py --multiproc --skip-criu
+--store --store-out /var/data --tag a1_fsdp_nvme`: suspend(HBM→host) → store(host→NVMe) → load → resume.
+
+**Footprint dumped = 127.7 GB** (gpu_freed 125.5 GB) — the *entire* HBM image across 4 GPUs, i.e.
+**2.65× the 48.2 GB DCP logical state**. Steady allocated was only 12.3 GB/GPU, but ~31 GB/GPU was
+resident (caching-allocator high-water from the backward activation peak + CUDA context + NCCL
+buffers) and cuda-checkpoint dumps all of it. **This is the transparency tax in bytes: transparent
+checkpoint pays for the allocator's reserved pool, not the logical tensors.**
+
+| leg | latency | rate | energy (abs ∫P dt) | J/GB |
+|---|---|---|---|---|
+| suspend HBM→host | 23.60 s | 5.41 GB/s | 10.88 kJ | 85.2 |
+| store host→NVMe | 20.36 s | 6.27 GB/s | 7.58 kJ | 59.3 |
+| load NVMe→host | 9.98 s | 12.80 GB/s | 3.68 kJ | 28.9 |
+| resume host→HBM | 7.84 s | 16.29 GB/s | 3.73 kJ | 29.2 |
+| **round-trip** | **61.8 s** | | **25.87 kJ** | **202.6** |
+
+- Absolute energy includes all 4 GPUs idling at ~76 W each through the full 62 s (that idle-hold is
+  real cost — why suspend's 85 J/GB exceeds the single-GPU HBM→host component fit of 41 J/GB).
+- **Transparent vs DCP:** 2.65× the bytes (127.7 vs 48.2 GB), 1.7× the wall-clock (61.8 vs 36.3 s),
+  but resumes the SAME process in place (no re-import/re-load/re-init), whereas DCP requires a full
+  restart whose cost is NOT in the 36.3 s. The two mechanisms trade image size + in-place resume.
+- Rows tagged `tag=a1_fsdp_nvme` in `data/timed_dump.jsonl`. SATA tier: TODO (`--store-out /home/test`).
+
 ## Headline finding: the mechanism depends on the WORKLOAD TYPE
 | workload type | temporal mechanism | resumes in place? |
 |---|---|---|
