@@ -88,6 +88,9 @@ def main() -> None:
     ap.add_argument("--baseline", type=float, default=5.0)
     ap.add_argument("--hold-seconds", type=float, default=0.0, help="parked-state hold per cycle")
     ap.add_argument("--cycle-gap", type=float, default=3.0)
+    ap.add_argument("--chunks", type=int, default=1,
+                    help="hold_gpu allocation count (probe per-allocation checkpoint "
+                         "overhead; raise to mimic a real workload's many tensors)")
     args = ap.parse_args()
 
     pf = td.preflight(argparse.Namespace(cc_bin=None, criu_bin=None))
@@ -103,7 +106,8 @@ def main() -> None:
     for gb in sizes:
         print(f"\n[ckpt-sweep] ===== footprint {gb} GiB =====")
         proc = subprocess.Popen(
-            [sys.executable, hold_py, "--gb", str(gb), "--gpu", str(args.gpu), "--seconds", "100000"],
+            [sys.executable, hold_py, "--gb", str(gb), "--gpu", str(args.gpu),
+             "--chunks", str(args.chunks), "--seconds", "100000"],
             start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
             pids, used = wait_for_alloc(gb * (1024 ** 3) * 0.9)
