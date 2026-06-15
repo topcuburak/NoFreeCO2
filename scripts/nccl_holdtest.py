@@ -19,6 +19,7 @@ Then re-init NCCL on the workers and read the timing:
 from __future__ import annotations
 
 import argparse
+import datetime
 import glob
 import os
 import time
@@ -36,6 +37,9 @@ def main() -> None:
 
     rank = int(os.environ["RANK"])
     local = int(os.environ["LOCAL_RANK"])
+    world = int(os.environ["WORLD_SIZE"])
+    master_addr = os.environ.get("MASTER_ADDR", "127.0.0.1")
+    base_port = int(os.environ.get("MASTER_PORT", "29500"))
     if rank == 0:                                   # clean stale flags
         for f in [args.resume_flag] + glob.glob("/tmp/nccl_destroyed.*"):
             try:
@@ -71,16 +75,22 @@ def main() -> None:
     while not os.path.exists(args.resume_flag):
         time.sleep(1)
 
-    # ===== RE-INIT NCCL and time it =====
+    # ===== RE-INIT NCCL with a FRESH rendezvous and time it =====
+    # cuda-checkpoint restores CUDA state but NOT sockets, and torchrun's original
+    # TCPStore holds stale NCCL bootstrap addresses -> reusing it gives "connection
+    # refused". So stand up a NEW TCPStore on a new port for the re-init.
     t0 = time.time()
-    dist.init_process_group("nccl")
+    new_port = base_port + 1
+    store = dist.TCPStore(master_addr, new_port, world, is_master=(rank == 0),
+                          timeout=datetime.timedelta(seconds=120))
+    dist.init_process_group("nccl", store=store, rank=rank, world_size=world)
     for _ in range(5):
         dist.all_reduce(x)
         torch.cuda.synchronize(dev)
     dist.barrier()
     dt = time.time() - t0
-    print(f"[rank{rank} PID={os.getpid()}] NCCL RE-INIT + all-reduce OK in {dt:.2f}s "
-          f"(post-checkpoint)", flush=True)
+    print(f"[rank{rank} PID={os.getpid()}] NCCL RE-INIT (fresh store) + all-reduce OK "
+          f"in {dt:.2f}s (post-checkpoint)", flush=True)
     time.sleep(120)
     dist.destroy_process_group()
 
