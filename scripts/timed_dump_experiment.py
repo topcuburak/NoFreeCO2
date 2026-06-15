@@ -96,7 +96,7 @@ def pid_gpu_indices(pids) -> list[int] | None:
 
 def dump_and_resume(tele, cc_bin, criu_bin, pids, out_dir, mark_min, baseline, keep_images,
                     multiproc=False, criu_root=None, hold_seconds=0.0, skip_criu=False,
-                    store=False, store_out=None):
+                    store=False, store_out=None, tag=None):
     """One full cycle, measured records tagged by mark:
     suspend (HBM->host) -> [store (host->NVMe)] -> [hold] -> [load (NVMe->host)] -> resume.
 
@@ -157,6 +157,8 @@ def dump_and_resume(tele, cc_bin, criu_bin, pids, out_dir, mark_min, baseline, k
             config={"mark_min": mark_min, "domain": "host", "phase": "hold",
                     "hold_seconds": hold_seconds})
         rec_h.extra["mark_min"] = mark_min
+        if tag:
+            rec_h.config["tag"] = tag
         write_record(rec_h, "timed_dump")
 
     # phase 3b: LOAD (NVMe -> host DRAM) -- cold read back before resume
@@ -185,6 +187,8 @@ def dump_and_resume(tele, cc_bin, criu_bin, pids, out_dir, mark_min, baseline, k
             + ([rec_load] if rec_load else []) + [rec_r])
     for r in recs:
         r.extra["mark_min"] = mark_min
+        if tag:
+            r.config["tag"] = tag
         print_record(r)
         write_record(r, "timed_dump")
     footprint_gb = rec_s.extra.get("gpu_freed_bytes", 0) / 1e9
@@ -223,6 +227,9 @@ def main() -> None:
                          "suspend and resume (device-rate O_DIRECT proxy for the disk persist)")
     ap.add_argument("--store-out", default="/var/data",
                     help="dir for the store proxy file (put on the tier you want, e.g. /var/data)")
+    ap.add_argument("--tag", default=None,
+                    help="label written into each record's config (e.g. a1_fsdp_nvme) to separate "
+                         "this run from other timed_dump rows in data/timed_dump.jsonl")
     args = ap.parse_args()
 
     pf = td.preflight(args)
@@ -255,7 +262,7 @@ def main() -> None:
                                 args.out, m, args.baseline, args.keep_images,
                                 multiproc=args.multiproc, criu_root=args.criu_root,
                                 hold_seconds=args.hold_seconds, skip_criu=args.skip_criu,
-                                store=args.store, store_out=args.store_out)
+                                store=args.store, store_out=args.store_out, tag=args.tag)
             except Exception as e:
                 print(f"[timed] mark {m}min FAILED: {type(e).__name__}: {e}")
                 print(f"[timed] (if criu errored, paste it -- likely needs extra flags)")

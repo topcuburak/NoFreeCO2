@@ -6,17 +6,31 @@
 
 ## Two mechanisms — and why A1 differs from serving (S1/A2)
 
-### Mechanism 1 — in-place transparent (cuda-checkpoint): FAILS TO RESUME
-Ran real FSDP training, then `pause → dist.destroy_process_group() → cuda-checkpoint suspend/resume
-→ init_process_group(fresh store) → CONTINUE`. The **checkpoint/suspend/resume succeed and reinit is
-~0.9 s** (same as nccl_holdtest), **but continuing training CRASHES** on the first FSDP forward:
+### Mechanism 1 — in-place transparent (cuda-checkpoint): WORKS with a process-group rebind
+Ran real FSDP training, then `pause → dist.destroy_process_group() → [cuda-checkpoint suspend/resume]
+→ init_process_group(fresh store) → rebind FSDP → CONTINUE`.
+
+**First attempt FAILED to resume** on the first FSDP forward after reinit:
 ```
 _all_gather_flat_param → all_gather_into_tensor → DistBackendError: NCCL communicator was aborted on rank N
 ```
-**Cause:** FSDP caches the process-group/communicator handle at wrap time; `destroy_process_group`
-aborts it, and re-init (new default PG) does NOT update FSDP's cached reference → aborted comm.
-**So in-place transparent suspend/resume is a dead end for FSDP training** (unlike vLLM serving,
-which re-creates communicators — vLLM RFC vllm#34303). This is independent of cuda-checkpoint.
+**Cause:** FSDP caches the process-group/communicator handle at wrap time (per wrapped layer AND per
+flat-param handle); `destroy_process_group` aborts it, and re-init (new default PG) does NOT update
+FSDP's cached reference → aborted comm. Note this is a *cached-handle* problem, independent of WHERE
+we suspend — we already suspend at a clean step boundary (barrier + synchronize, no collective in flight),
+so coarser granularity does not help.
+
+**FIX (validated 2026-06-16):** after reinit, walk `FSDP.fsdp_modules(model)` and re-point every
+cached `process_group` (on the module, its `_fsdp_state`, and each flat-param handle) to the fresh
+`dist.group.WORLD` (`rebind_fsdp_pg` in `fsdp_train.py`). Re-pointed 33 modules + 33 handles; reinit
+1.02 s. **Training then continues correctly** — loss kept descending across the suspend boundary
+(12.56 → 12.25 → 12.21 → 12.18 → 12.08 over steps 6–11), proving weights AND AdamW momentum survived.
+So **in-place transparent suspend/resume IS feasible for FSDP training**, same family as vLLM serving
+(destroy/reinit communicators), once FSDP's cached PG refs are rebound.
+
+(So far validated WITHOUT cuda-checkpoint in the loop — i.e. the NCCL teardown/rebuild + FSDP rebind
+path. Next: slot the cuda-checkpoint suspend/store/load/resume into the held window to (a) prove it
+still resumes after HBM is evicted and restored and (b) measure the transparent-dump cost end-to-end.)
 
 ### Mechanism 2 — app-native state-dict checkpoint (DCP): the REAL mechanism
 Training jobs suspend via `torch.distributed.checkpoint` (DCP): gather sharded {model, optimizer}
@@ -38,11 +52,15 @@ state → disk, reload into a fresh process. Measured (NVMe `/var/data`):
 | workload type | temporal mechanism | resumes in place? |
 |---|---|---|
 | **serving** (TP=1, and TP>1 with destroy/reinit) | transparent cuda-checkpoint (HBM→host) | ✅ yes |
-| **training** (FSDP) | app-native state-dict (DCP) save + RESTART | ❌ no — must restart |
+| **training** (FSDP), transparent | cuda-checkpoint (HBM→host) + destroy/reinit + **FSDP PG rebind** | ✅ yes (validated) |
+| **training** (FSDP), app-native | state-dict (DCP) save + RESTART | ✅ yes (fresh process) |
 
-→ A1's temporal cost is **not** comparable per-leg to A2's; it's a single combined gather+write op,
-storage-bound, with a 2–5× framework tax over raw disk. The in-place transparent path checkpoints
-but cannot resume training.
+→ A1 has **two** valid temporal mechanisms. (1) **Transparent in-place** — same as serving: evict the
+full HBM image, hold, restore, continue the same process; works once FSDP's cached PG is rebound. Cost
+is the full per-GPU HBM footprint (suspend/store/load/resume), comparable per-leg to A2. (2) **App-native
+DCP** — a single gather+write of logical state (48.2 GB: weights + AdamW m,v), storage-bound, 2–5×
+framework tax over raw disk, requires a process restart. Transparent dumps the whole image; DCP dumps
+only the numbers needed to keep training.
 
 ## Caveats / TODO
 - DCP run captured **latency + size only** (no telemetry wrapper around torchrun) → energy not
