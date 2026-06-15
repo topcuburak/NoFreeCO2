@@ -51,8 +51,11 @@ def main() -> None:
     rank = int(os.environ["RANK"]); local = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local); dev = torch.device(f"cuda:{local}")
     dist.init_process_group("nccl")
-    if rank == 0 and os.path.isdir(args.ckpt_dir):
-        shutil.rmtree(args.ckpt_dir, ignore_errors=True)
+    if rank == 0:                                     # keep the (user-owned) dir; clear contents
+        os.makedirs(args.ckpt_dir, exist_ok=True)
+        for name in os.listdir(args.ckpt_dir):
+            p = os.path.join(args.ckpt_dir, name)
+            shutil.rmtree(p, ignore_errors=True) if os.path.isdir(p) else os.remove(p)
     dist.barrier()
 
     log(rank, f"loading {args.model} ...")
