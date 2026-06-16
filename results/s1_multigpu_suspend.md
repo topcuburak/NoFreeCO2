@@ -89,13 +89,39 @@ increase; the synthetic S1 baseline gives 8.3× — the storage-tier sensitivity
 mechanism (footprint-driven `power÷bandwidth`), not workload-specific. On SATA the GPU legs become a
 rounding error (storage 93% of round-trip); on NVMe they're ~half.
 
-## S1 — COMPLETE (both tiers, 1–4 GPUs, 9–140 GB)
+## Allocation-structure probe (`s1_mg_chunks_nvme`) — allocation count is IRRELEVANT
+Fixed 4 GPU × 32 GiB = 139.5 GB, swept allocations PER GPU 1→1024 (total `cuda-checkpoint` regions
+4→4096), suspend/resume only, 4 cycles. Robust floor (2 fastest):
+
+| chunks/GPU | total allocs | suspend_s | susp GB/s |
+|---|---|---|---|
+| 1 | 4 | 15.78* | 8.84* |
+| 4 | 16 | 25.72 | 5.42 |
+| 16 | 64 | 25.69 | 5.43 |
+| 64 | 256 | 25.66 | 5.44 |
+| 256 | 1024 | 25.75 | 5.42 |
+| 1024 | 4096 | 26.02 | 5.36 |
+
+**Suspend is flat within 0.36 s across 16→4096 allocations** → allocation count does NOT drive
+checkpoint cost. (*chunks=1 floor 15.78 s is an intermittent fast-path — its *mean* is 27.2 s,
+matching the rest, and `s1_mg_nvme_full` measured chunks=1 at 27.25 s; ~26 s is the consistent value.)
+chunks=4096/GPU skipped (4096×8 MB tensors + allocator metadata exceeded the 40 GB card — harmless,
+trend already flat). Resume floor ~9 s flat too.
+
+**So there is NO allocation-structure term.** Mechanism cost is *purely footprint-driven*. This closes
+the A1 question: clean A1 (5.47 GB/s, hundreds of FSDP tensors) ≈ S1 (5.10, 1 tensor) ≈ this probe
+(flat to 4096 allocs) — the earlier A1 "+85% / 2.74 GB/s" was a measurement artifact (verbose-cc +
+memory pressure), NOT fragmentation. Cleaner model: `cost = a + b·S`, S = total bytes, full stop.
+
+## S1 — COMPLETE (both tiers, 1–4 GPUs, 9–140 GB, 1–4096 allocations)
 Final footprint-driven model, per leg (`cost = a + b·S`, S = total bytes):
 - **suspend** ~5.1–5.4 GB/s (tier-independent), + small per-process term (~0.5–1 s/GPU subprocess overhead)
 - **resume** ~14–17 GB/s (tier-independent), ~8% stall tail (24–32 s transients)
 - **store/load** NVMe 6.2/12.8, SATA 0.49/0.53 GB/s (byte-linear, GPU-count-independent)
 - **round-trip** NVMe 0.506 s/GB, SATA 4.183 s/GB
-This is the clean lower bound; real workloads add the allocation-structure premium (`--chunks` probe, pending).
+- **allocation structure: no effect** — flat from 1 tensor to 4096 allocations; cost is total-bytes only
+This is the clean lower bound AND the real cost — the synthetic baseline equals real-workload cost
+(no allocation-structure premium), validated against A1 at matched footprint. S1 is fully closed.
 
 ## Reproduce
 ```
