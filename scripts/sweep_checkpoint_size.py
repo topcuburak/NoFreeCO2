@@ -95,6 +95,10 @@ def main() -> None:
                     help="comma allocation counts to sweep at a FIXED footprint (=first --sizes), "
                          "e.g. 1,2,4,16,64,256,1024 -- isolates cost-vs-allocation-structure")
     ap.add_argument("--tag", default=None, help="tag written into each record (e.g. s1_chunks_nvme)")
+    ap.add_argument("--no-store", action="store_true",
+                    help="skip the store/load (disk) legs -- suspend/resume only. Right for the "
+                         "chunks probe (allocation structure only affects the cuda-checkpoint legs; "
+                         "store/load are byte-bound and already characterized).")
     args = ap.parse_args()
 
     pf = td.preflight(argparse.Namespace(cc_bin=None, criu_bin=None))
@@ -140,8 +144,8 @@ def main() -> None:
                         cyc.append(tde.dump_and_resume(
                             tele, pf["cuda_checkpoint"], pf["criu"], pids,
                             out_dir=args.store_out, mark_min=mark, baseline=args.baseline,
-                            keep_images=False, skip_criu=True, store=True, store_out=args.store_out,
-                            hold_seconds=args.hold_seconds, tag=args.tag))
+                            keep_images=False, skip_criu=True, store=not args.no_store,
+                            store_out=args.store_out, hold_seconds=args.hold_seconds, tag=args.tag))
                     except Exception as e:
                         print(f"[ckpt-sweep] {label} cycle {c+1} FAILED: {type(e).__name__}: {e}")
                     if c < args.cycles - 1:
