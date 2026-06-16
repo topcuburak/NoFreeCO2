@@ -74,6 +74,10 @@ def main() -> None:
                     help="if set, run the FULL cycle (suspend->store->load->resume) writing the "
                          "footprint to this dir (tier). Omit -> suspend/resume only (GPU legs). "
                          "drive coeff auto: NVMe 50 W, SATA (path has 'home') 3 W.")
+    ap.add_argument("--chunks", type=int, default=1, help="hold_gpu allocations per GPU")
+    ap.add_argument("--chunks-list", default=None,
+                    help="sweep allocation count PER GPU at a fixed config (=first --gpu-counts x "
+                         "first --sizes), e.g. 1,4,16,64,256,1024,4096 -- allocation-structure probe")
     args = ap.parse_args()
     do_store = args.store_out is not None
     drive_w = 3.0 if (args.store_out and "home" in args.store_out) else 50.0
@@ -85,17 +89,27 @@ def main() -> None:
     hold_py = os.path.join(_REPO, "scripts", "hold_gpu.py")
     counts = [int(c) for c in args.gpu_counts.split(",") if c.strip()]
     sizes = [float(s) for s in args.sizes.split(",") if s.strip()]
+    # configs = (n, per_gpu, chunks, mark). chunks-list -> sweep allocations at a fixed (n, per_gpu),
+    # mark = chunks; else -> footprint sweep at fixed --chunks, mark = n*1000 + total_GB.
+    if args.chunks_list:
+        cl = [int(c) for c in args.chunks_list.split(",") if c.strip()]
+        n0, s0 = counts[0], sizes[0]
+        configs = [(n0, s0, ch, ch) for ch in cl]
+        print(f"[mg-sweep] CHUNKS sweep at {n0}GPU x {s0}GiB ({n0*s0:.0f}GB total): {cl} alloc/GPU")
+    else:
+        configs = [(n, s, args.chunks, n * 1000 + int(round(n * s)))
+                   for n, s in itertools.product(counts, sizes)]
     rows = []
 
-    for n, per_gpu in itertools.product(counts, sizes):
+    for n, per_gpu, chunks, mark in configs:
         total = n * per_gpu
-        label = f"{n}gpu x {per_gpu}GiB = {total:.0f}GiB total"
+        label = f"{n}gpu x {per_gpu}GiB = {total:.0f}GiB total, {chunks} alloc/GPU"
         print(f"\n[mg-sweep] ===== {label} =====")
         procs = []
         for g in range(n):
             procs.append(subprocess.Popen(
                 [sys.executable, hold_py, "--gb", str(per_gpu), "--gpu", str(g),
-                 "--chunks", "1", "--seconds", "100000"],
+                 "--chunks", str(chunks), "--seconds", "100000"],
                 start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
         try:
             pids = wait_for_n(n, total * (1024 ** 3) * 0.85)
@@ -113,7 +127,7 @@ def main() -> None:
                     try:
                         cyc.append(tde.dump_and_resume(
                             tele, pf["cuda_checkpoint"], pf["criu"], pids,
-                            out_dir=args.store_out or "/tmp", mark_min=n * 1000 + int(round(total)),
+                            out_dir=args.store_out or "/tmp", mark_min=mark,
                             baseline=args.baseline, keep_images=False, multiproc=True,
                             skip_criu=True, store=do_store, store_out=args.store_out,
                             drive_w=drive_w, tag=args.tag))
@@ -124,7 +138,7 @@ def main() -> None:
             finally:
                 tele.stop()
             if cyc:
-                rows.append((n, per_gpu, total, cyc))
+                rows.append((n, per_gpu, total, chunks, cyc))
         finally:
             for p in procs:
                 try:
@@ -140,31 +154,38 @@ def main() -> None:
     def msd(v):
         return (statistics.mean(v), statistics.stdev(v) if len(v) > 1 else 0.0) if v else (0.0, 0.0)
 
-    print(f"\n=== MULTI-GPU TRANSPARENT SUSPEND/RESTORE vs FOOTPRINT ===  mean±std")
-    print(f"{'nGPU':>5}{'per_GB':>8}{'total_GB':>9}{'susp_s':>9}{'res_s':>9}"
+    chunks_mode = bool(args.chunks_list)
+    print(f"\n=== MULTI-GPU SUSPEND/RESTORE vs {'ALLOCATIONS/GPU' if chunks_mode else 'FOOTPRINT'} ===  mean±std")
+    print(f"{'nGPU':>5}{'per_GB':>8}{'total_GB':>9}{'chunks':>7}{'susp_s':>9}{'res_s':>9}"
           f"{'susp_GBps':>10}{'susp_kJ':>9}{'res_kJ':>8}{'FULL_kJ':>9}")
     pts = []
-    for n, per_gpu, total, cyc in rows:
+    for n, per_gpu, total, chunks, cyc in rows:
         foot = msd([c["suspend"].extra.get("gpu_freed_bytes", 0) / 1e9 for c in cyc])[0]
         sl = msd([c["suspend"].latency_s for c in cyc])[0]
         rl = msd([c["resume"].latency_s for c in cyc])[0]
         se = msd([full_e(c["suspend"]) / 1000 for c in cyc])[0]
         re = msd([full_e(c["resume"]) / 1000 for c in cyc])[0]
         bw = foot / sl if sl else 0.0
-        print(f"{n:5d}{per_gpu:8.0f}{foot:9.1f}{sl:9.2f}{rl:9.2f}{bw:10.2f}{se:9.2f}{re:8.2f}{se+re:9.2f}")
-        pts.append((foot, sl, rl, se + re))
+        print(f"{n:5d}{per_gpu:8.0f}{foot:9.1f}{chunks:7d}{sl:9.2f}{rl:9.2f}{bw:10.2f}{se:9.2f}{re:8.2f}{se+re:9.2f}")
+        pts.append((chunks if chunks_mode else foot, sl, rl, se + re))
 
     if len(pts) >= 2:
         X = [p[0] for p in pts]
         aS, bS = _lstsq(X, [p[1] for p in pts])
         aR, bR = _lstsq(X, [p[2] for p in pts])
-        aE, bE = _lstsq(X, [p[3] for p in pts])
-        print(f"\nAffine fit vs TOTAL footprint S (across all GPU counts):")
-        print(f"  suspend:  {aS:.2f} s + {bS:.4f} s/GB   (= {1/bS if bS else 0:.2f} GB/s)")
-        print(f"  resume:   {aR:.2f} s + {bR:.4f} s/GB   (= {1/bR if bR else 0:.2f} GB/s)")
-        print(f"  energy:   {aE:.2f} kJ + {bE:.4f} kJ/GB  (FULL: meas GPU+CPU + modeled DRAM)")
-        print("  -> if the per-GB slope is the SAME across GPU counts, lock-all/checkpoint-all is "
-              "sequential (no contention) and S1 is one footprint-driven coefficient.")
+        unit = "alloc" if chunks_mode else "GB"
+        if chunks_mode:
+            print(f"\nFit vs allocations/GPU (fixed footprint -- per-allocation overhead):")
+            print(f"  suspend:  {aS:.2f} s + {bS*1000:.3f} ms/alloc")
+            print(f"  resume:   {aR:.2f} s + {bR*1000:.3f} ms/alloc")
+            print("  -> flat slope => allocation count does NOT drive checkpoint cost; "
+                  "chunks=1 synthetic baseline == real fragmented-workload cost.")
+        else:
+            print(f"\nAffine fit vs TOTAL footprint S (across all GPU counts):")
+            print(f"  suspend:  {aS:.2f} s + {bS:.4f} s/GB   (= {1/bS if bS else 0:.2f} GB/s)")
+            print(f"  resume:   {aR:.2f} s + {bR:.4f} s/GB   (= {1/bR if bR else 0:.2f} GB/s)")
+            print("  -> same per-GB slope across GPU counts => sequential lock/checkpoint, "
+                  "footprint-driven coefficient.")
     print("Raw records -> data/timed_dump.jsonl (multiproc=true)")
 
 
