@@ -133,8 +133,11 @@ def main() -> None:
                + args.base.split() + cfg.split())
         print(f"\n[sweep] === config {ci}: {cfg} ===")
         print(f"[sweep] launch: {' '.join(cmd)}")
+        serve_log_path = f"/tmp/a2_serve_cfg{ci}.log"
+        serve_log = open(serve_log_path, "w")          # capture serve output (was /dev/null -> blind)
+        print(f"[sweep] serve output -> {serve_log_path}")
         proc = subprocess.Popen(cmd, env=serve_env, start_new_session=True,
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                stdout=serve_log, stderr=subprocess.STDOUT)
         try:
             pids, used = wait_for_ready(args.min_gb, args.timeout)
             if not pids:
