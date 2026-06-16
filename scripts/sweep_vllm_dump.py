@@ -111,6 +111,8 @@ def main() -> None:
     ap.add_argument("--timeout", type=float, default=300.0, help="max wait for vLLM startup")
     ap.add_argument("--cycles", type=int, default=3, help="suspend/resume cycles per config (mean±std)")
     ap.add_argument("--cycle-gap", type=float, default=5.0, help="serve-resume gap between cycles")
+    ap.add_argument("--tag", default=None, help="tag written into each record (e.g. a2_tp1_nvme) "
+                    "to separate this run in data/timed_dump.jsonl")
     args = ap.parse_args()
 
     pf = td.preflight(argparse.Namespace(cc_bin=None, criu_bin=None))
@@ -152,8 +154,9 @@ def main() -> None:
                     try:
                         cycles.append(tde.dump_and_resume(
                             tele, pf["cuda_checkpoint"], pf["criu"], pids,
-                            out_dir=args.store_out, mark_min=ci, baseline=args.baseline,
-                            keep_images=False, skip_criu=True, store=True, store_out=args.store_out))
+                            out_dir=args.store_out, mark_min=ci * 1000 + cyc, baseline=args.baseline,
+                            keep_images=False, skip_criu=True, store=True, store_out=args.store_out,
+                            tag=args.tag))
                     except Exception as e:
                         print(f"[sweep] config {ci} cycle {cyc + 1} FAILED: {type(e).__name__}: {e}")
                     if cyc < args.cycles - 1:
