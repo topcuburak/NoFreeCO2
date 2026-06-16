@@ -55,9 +55,47 @@ of the GPU legs and byte-linearity of the storage legs.
    148 GB) measured 27 s ≈ S1 fit at 148 GB (0.79 + 0.196·148 = 29.8 s) — consistent. The real-workload
    premium over this baseline is the allocation-structure term (separate `--chunks` probe, pending).
 
-## SATA tier
-Full-cycle SATA run in progress (`s1_mg_sata_full`, `--store-out /home/test`). GPU legs (suspend/resume)
-tier-independent (= NVMe above); store/load expected ~0.48/0.53 GB/s (13×/24× slower). TODO: fold in.
+## SATA tier (full cycle, `s1_mg_sata_full`, robust floor)
+| nGPU | total_GB | suspend_s | store_s | load_s | resume_s | RT_s |
+|---|---|---|---|---|---|---|
+| 1 | 9.1 | 3.34 | 22.86 | 21.46 | 2.46 | 50.11 |
+| 1 | 34.9 | 8.03 | 76.20 | 70.43 | 2.62 | 157.28 |
+| 2 | 69.8 | 14.24 | 148.41 | 135.66 | 5.14 | 303.45 |
+| 4 | 139.5 | 27.19 | 290.99 | 266.87 | 9.17 | 594.22 |
+
+(12 configs; representative rows. Full table in `data/timed_dump.jsonl` tag `s1_mg_sata_full`.)
+
+**SATA per-leg fit vs total footprint:**
+| leg | a (s) | b (s/GB) | rate |
+|---|---|---|---|
+| suspend | 1.94 | 0.1845 | 5.42 GB/s |
+| store (SATA) | 4.41 | 2.0579 | **0.49 GB/s** |
+| load (SATA) | 4.25 | 1.8825 | **0.53 GB/s** |
+| resume | 2.26 | 0.0585 | 17.1 GB/s |
+| **round-trip** | 12.85 | 4.1834 | 0.24 GB/s |
+
+**GPU legs are tier-independent (cross-check):** suspend SATA 5.42 vs NVMe 5.10 GB/s; resume SATA 17.1 vs
+NVMe 14.3 GB/s — equal within floor noise, confirming suspend/resume never touch the disk. Store/load
+match the standalone storage sweep to two digits (0.48/0.53 GB/s).
+
+## NVMe vs SATA — storage-tier flip (round-trip slope)
+| | NVMe | SATA | ratio |
+|---|---|---|---|
+| round-trip slope | 0.506 s/GB | 4.183 s/GB | **8.3×** |
+| store+load share | ~47% | **~93%** | — |
+
+**S1 reproduces the real-workload flip:** A1 (real FSDP, 148 GB) measured an 8.8× NVMe→SATA round-trip
+increase; the synthetic S1 baseline gives 8.3× — the storage-tier sensitivity is intrinsic to the
+mechanism (footprint-driven `power÷bandwidth`), not workload-specific. On SATA the GPU legs become a
+rounding error (storage 93% of round-trip); on NVMe they're ~half.
+
+## S1 — COMPLETE (both tiers, 1–4 GPUs, 9–140 GB)
+Final footprint-driven model, per leg (`cost = a + b·S`, S = total bytes):
+- **suspend** ~5.1–5.4 GB/s (tier-independent), + small per-process term (~0.5–1 s/GPU subprocess overhead)
+- **resume** ~14–17 GB/s (tier-independent), ~8% stall tail (24–32 s transients)
+- **store/load** NVMe 6.2/12.8, SATA 0.49/0.53 GB/s (byte-linear, GPU-count-independent)
+- **round-trip** NVMe 0.506 s/GB, SATA 4.183 s/GB
+This is the clean lower bound; real workloads add the allocation-structure premium (`--chunks` probe, pending).
 
 ## Reproduce
 ```
