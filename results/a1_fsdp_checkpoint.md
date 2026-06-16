@@ -48,7 +48,38 @@ state → disk, reload into a fresh process. Measured (NVMe `/var/data`):
   write 5.8 (**2.3×**); load 2.75 vs raw read 12.7 (**4.6×**) — gather/serialize/deserialize overhead
   on top of the disk I/O. (SATA tier: TODO — expect save ~100 s+ at 0.48 GB/s.)
 
-## Transparent dump cost — MEASURED (2026-06-16, NVMe `/var/data`, 4× A100)
+## FINAL — 10-cycle steady-state, transparent dump (2026-06-16, NVMe, tag `a1_nvme_10cyc`)
+Real Alpaca fine-tune, 3000 steps, **10 in-place suspend/dump/resume cycles** at steps 300…3000,
+driven by `scripts/multi_suspend_driver.py` (marker handshake). 10/10 cycles dumped+resumed, all
+`rebind_fsdp_pg` succeeded, **loss continuous across every suspend** (0.9–1.2 band, no reset). This
+supersedes the single-shot numbers below, which were contaminated (see note).
+
+Variance **<0.3%** across 10 cycles. Energy = MEASURED GPU board (NVML, incl HBM) + CPU pkg (RAPL),
+plus MODELED DRAM (0.3 W/GB resident × t) + drive (NVMe 50 W on store/load) — kept separate:
+
+| leg | latency | rate | measured GPU+CPU | +DRAM | +drive | **FULL** |
+|---|---|---|---|---|---|---|
+| suspend HBM→host | 27.07 ± 0.08 s | 5.47 GB/s | 12.96 kJ | 1.22 | 0 | **14.18 kJ** |
+| store host→NVMe | 23.92 ± 0.10 s | 6.19 GB/s | 9.21 kJ | 1.08 | 1.20 | **11.48 kJ** |
+| load NVMe→host | 11.78 ± 0.02 s | 12.58 GB/s | 4.48 kJ | 0.53 | 0.59 | **5.60 kJ** |
+| resume host→HBM | 8.96 ± 0.02 s | 16.54 GB/s | 4.35 kJ | 0.40 | 0 | **4.75 kJ** |
+| **round-trip** | **71.74 ± 0.09 s** | | **30.99 kJ** | 3.23 | 1.79 | **36.02 ± 0.08 kJ** |
+
+- **Footprint 148.2 ± 0.0 GB** freed (37 GB/GPU). Measured split: GPU board ≈ 2/3, CPU pkg ≈ 1/3 per leg.
+  Modeled DRAM+drive add ~16% on top of measured (DRAM the larger; drive only on store/load).
+- **No cost drift:** round-trip FULL 35.9–36.1 kJ across all 10 rounds (steps 300→3000) — the
+  allocator high-water is set early and stable, so the transparent dump cost does not grow with training.
+- **Energy/byte (FULL, round-trip):** 36.02 kJ / 148.2 GB ≈ **243 J/GB** (measured-only 209 J/GB).
+- **Methodology fixes that made it clean:** `drop_caches()` before resume (killed the page-cache
+  pressure that paged out the cuda staging buffer → the 84 s resume outlier); `--verbose-cc` gate
+  (moved `get-state` subprocesses out of the timed op → un-inflated suspend). Both in commit `dd83199`.
+
+> NOTE: the single-shot numbers in the next section (114 s / 49 kJ) are **superseded/contaminated** —
+> 84 s resume was page-cache pressure, ~55 s suspend was in-loop get-state overhead. Use the 10-cycle
+> steady-state above (71.7 s / 36.0 kJ). The 2.65–3.1× transparency-tax-in-bytes finding still holds
+> (150 GB transparent vs 48 GB DCP logical).
+
+## Transparent dump cost — MEASURED (2026-06-16, NVMe `/var/data`, 4× A100) — SUPERSEDED (see above)
 Held the 4 FSDP ranks (PG destroyed), then ran `timed_dump_experiment.py --multiproc --skip-criu
 --store --store-out /var/data --tag a1_fsdp_nvme`: suspend(HBM→host) → store(host→NVMe) → load → resume.
 
