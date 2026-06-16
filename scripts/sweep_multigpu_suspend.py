@@ -66,11 +66,17 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="multi-GPU transparent suspend/restore cost vs footprint")
     ap.add_argument("--gpu-counts", default="1,2,4", help="comma GPU counts to sweep")
     ap.add_argument("--sizes", default="8,16,24,32", help="comma PER-GPU GiB footprints")
-    ap.add_argument("--cycles", type=int, default=3)
+    ap.add_argument("--cycles", type=int, default=4, help="cycles/config (cold cycle-0 dropped in analysis)")
     ap.add_argument("--baseline", type=float, default=5.0)
     ap.add_argument("--cycle-gap", type=float, default=3.0)
     ap.add_argument("--tag", default=None, help="record tag, e.g. s1_mg_nvme")
+    ap.add_argument("--store-out", default=None,
+                    help="if set, run the FULL cycle (suspend->store->load->resume) writing the "
+                         "footprint to this dir (tier). Omit -> suspend/resume only (GPU legs). "
+                         "drive coeff auto: NVMe 50 W, SATA (path has 'home') 3 W.")
     args = ap.parse_args()
+    do_store = args.store_out is not None
+    drive_w = 3.0 if (args.store_out and "home" in args.store_out) else 50.0
 
     pf = td.preflight(argparse.Namespace(cc_bin=None, criu_bin=None))
     if pf["euid"] != 0 or not pf["cuda_checkpoint"]:
@@ -107,9 +113,10 @@ def main() -> None:
                     try:
                         cyc.append(tde.dump_and_resume(
                             tele, pf["cuda_checkpoint"], pf["criu"], pids,
-                            out_dir="/tmp", mark_min=n * 1000 + int(round(total)),
+                            out_dir=args.store_out or "/tmp", mark_min=n * 1000 + int(round(total)),
                             baseline=args.baseline, keep_images=False, multiproc=True,
-                            skip_criu=True, store=False, tag=args.tag))
+                            skip_criu=True, store=do_store, store_out=args.store_out,
+                            drive_w=drive_w, tag=args.tag))
                     except Exception as e:
                         print(f"[mg-sweep] {label} cycle {c+1} FAILED: {type(e).__name__}: {e}")
                     if c < args.cycles - 1:
