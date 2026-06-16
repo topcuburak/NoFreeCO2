@@ -79,6 +79,44 @@ plus MODELED DRAM (0.3 W/GB resident × t) + drive (NVMe 50 W on store/load) —
 > steady-state above (71.7 s / 36.0 kJ). The 2.65–3.1× transparency-tax-in-bytes finding still holds
 > (150 GB transparent vs 48 GB DCP logical).
 
+## FINAL — 10-cycle steady-state, SATA tier (2026-06-16, `/home/test`, tag `a1_sata_10cyc`)
+Identical run, only `--store-out /home/test` (HPE SATA SSD, drive coeff 3 W). 10/10 cycles,
+footprint 148.2 GB, loss continuous across all suspends. Excludes round-10 **resume** only —
+an ssh-disconnect SIGHUP hit `torchrun` at the very end (after all 10 dumps completed) and made
+that one `cuda_resume` return in 1.12 s vs the other nine at 8.8 s; all 40 records are otherwise clean.
+
+| leg | latency | rate | measured GPU+CPU | +DRAM | +drive | **FULL** |
+|---|---|---|---|---|---|---|
+| suspend HBM→host | 27.1 ± 0.4 s | 5.47 GB/s | 13.0 kJ | 1.22 | 0 | **14.2 kJ** |
+| store host→SATA | 310.3 ± 0.8 s | 0.48 GB/s | 114.3 kJ | 14.00 | 0.93 | **129.3 kJ** |
+| load SATA→host | 284.4 ± 1.0 s | 0.52 GB/s | 103.0 kJ | 12.83 | 0.85 | **116.7 kJ** |
+| resume host→HBM | 8.8 ± 0.0 s (9) | 16.9 GB/s | 4.2 kJ | 0.40 | 0 | **4.6 kJ** |
+| **round-trip** | **630.6 s** | | **234.5 kJ** | 30.5 | 2.7 | **264.7 kJ** |
+
+### NVMe vs SATA — the storage-tier flip
+| | NVMe (`a1_nvme_10cyc`) | SATA (`a1_sata_10cyc`) | ratio |
+|---|---|---|---|
+| round-trip latency | 71.7 s | 630.6 s | **8.8×** |
+| round-trip FULL energy | 36.0 kJ | 264.7 kJ | **7.4×** |
+| energy/byte (FULL) | 243 J/GB | 1786 J/GB | 7.4× |
+| store+load share of round-trip | ~47% | **~93%** | — |
+
+**Findings:**
+1. **GPU legs are tier-independent** — suspend 27 s and resume 8.8 s are identical on both tiers (they
+   never touch the disk). The entire NVMe→SATA difference is the store/load legs (13× / 24× slower).
+2. **Cost dominance flips to storage** — on NVMe the GPU legs were ~half the cost; on SATA store+load
+   are 93% of both latency and energy.
+3. **The slow-tier energy is accelerator IDLE-HOLD, not the drive.** The store leg's 114.3 kJ measured
+   splits **GPU idle-hold 73.9 kJ + CPU 40.4 kJ**, while the modeled SATA drive is only **0.93 kJ**.
+   So the cost of a slow tier is 4× A100 sitting *reserved-but-idle* for ~10 min/cycle, NOT the disk's
+   own power. (Contrast NVMe, where the 50 W RAID-0 drive was a meaningful share over its short transfer.)
+4. **DRAM resident-refresh becomes significant** — modeled DRAM rises to 30.5 kJ round-trip (vs 3.2 kJ on
+   NVMe) purely because the 148 GB staging buffer is resident ~10× longer during the slow store/load.
+
+→ Storage-tier sensitivity is dramatic and the model is `power÷bandwidth`-clean: same bytes, same GPU
+legs, but a 12× slower tier multiplies the round-trip cost ~8× and shifts it from compute-side to a
+storage-bound idle-hold. For carbon-aware viability, the tier choice is first-order.
+
 ## Transparent dump cost — MEASURED (2026-06-16, NVMe `/var/data`, 4× A100) — SUPERSEDED (see above)
 Held the 4 FSDP ranks (PG destroyed), then ran `timed_dump_experiment.py --multiproc --skip-criu
 --store --store-out /var/data --tag a1_fsdp_nvme`: suspend(HBM→host) → store(host→NVMe) → load → resume.
