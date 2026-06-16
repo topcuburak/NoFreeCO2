@@ -91,6 +91,10 @@ def main() -> None:
     ap.add_argument("--chunks", type=int, default=1,
                     help="hold_gpu allocation count (probe per-allocation checkpoint "
                          "overhead; raise to mimic a real workload's many tensors)")
+    ap.add_argument("--chunks-list", default=None,
+                    help="comma allocation counts to sweep at a FIXED footprint (=first --sizes), "
+                         "e.g. 1,2,4,16,64,256,1024 -- isolates cost-vs-allocation-structure")
+    ap.add_argument("--tag", default=None, help="tag written into each record (e.g. s1_chunks_nvme)")
     args = ap.parse_args()
 
     pf = td.preflight(argparse.Namespace(cc_bin=None, criu_bin=None))
@@ -101,18 +105,28 @@ def main() -> None:
 
     hold_py = os.path.join(_REPO, "scripts", "hold_gpu.py")
     sizes = [float(s) for s in args.sizes.split(",") if s.strip()]
+    # configs = list of (gb, chunks, mark). chunks-list -> sweep allocation count at fixed footprint
+    # (mark = chunk count); else -> sweep footprint at fixed --chunks (mark = GiB).
+    if args.chunks_list:
+        cc = [int(c) for c in args.chunks_list.split(",") if c.strip()]
+        fixed = sizes[0]
+        configs = [(fixed, c, c) for c in cc]
+        print(f"[ckpt-sweep] CHUNKS sweep at fixed {fixed} GiB: {cc} allocations")
+    else:
+        configs = [(gb, args.chunks, int(gb)) for gb in sizes]
     rows = []
 
-    for gb in sizes:
-        print(f"\n[ckpt-sweep] ===== footprint {gb} GiB =====")
+    for gb, chunks, mark in configs:
+        label = f"{gb} GiB / {chunks} alloc"
+        print(f"\n[ckpt-sweep] ===== {label} =====")
         proc = subprocess.Popen(
             [sys.executable, hold_py, "--gb", str(gb), "--gpu", str(args.gpu),
-             "--chunks", str(args.chunks), "--seconds", "100000"],
+             "--chunks", str(chunks), "--seconds", "100000"],
             start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
             pids, used = wait_for_alloc(gb * (1024 ** 3) * 0.9)
             if not pids:
-                print(f"[ckpt-sweep] {gb} GiB: alloc TIMEOUT -- skipping")
+                print(f"[ckpt-sweep] {label}: alloc TIMEOUT -- skipping")
                 continue
             print(f"[ckpt-sweep] allocated (PIDs {pids}, {used/1e9:.1f} GB); settling 3s")
             time.sleep(3)
@@ -121,21 +135,21 @@ def main() -> None:
             cyc = []
             try:
                 for c in range(args.cycles):
-                    print(f"[ckpt-sweep] {gb} GiB cycle {c+1}/{args.cycles}")
+                    print(f"[ckpt-sweep] {label} cycle {c+1}/{args.cycles}")
                     try:
                         cyc.append(tde.dump_and_resume(
                             tele, pf["cuda_checkpoint"], pf["criu"], pids,
-                            out_dir=args.store_out, mark_min=int(gb), baseline=args.baseline,
+                            out_dir=args.store_out, mark_min=mark, baseline=args.baseline,
                             keep_images=False, skip_criu=True, store=True, store_out=args.store_out,
-                            hold_seconds=args.hold_seconds))
+                            hold_seconds=args.hold_seconds, tag=args.tag))
                     except Exception as e:
-                        print(f"[ckpt-sweep] {gb} GiB cycle {c+1} FAILED: {type(e).__name__}: {e}")
+                        print(f"[ckpt-sweep] {label} cycle {c+1} FAILED: {type(e).__name__}: {e}")
                     if c < args.cycles - 1:
                         time.sleep(args.cycle_gap)
             finally:
                 tele.stop()
             if cyc:
-                rows.append((gb, cyc))
+                rows.append((gb, chunks, cyc))
         finally:
             try:
                 os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
@@ -160,11 +174,13 @@ def main() -> None:
     def leg_e(cyc, key):
         return [cpu_abs(c[key]) + gpu_abs(c[key]) for c in cyc if c.get(key)]
 
-    print(f"\n=== TEMPORAL SUSPEND-TO-DISK COST vs FOOTPRINT ({args.store_out}) ===  mean±std")
-    print(f"{'GiB':>5}{'foot_GB':>9}{'susp_s':>9}{'store_s':>9}{'load_s':>9}{'res_s':>9}"
+    chunks_mode = bool(args.chunks_list)
+    print(f"\n=== TEMPORAL SUSPEND-TO-DISK COST vs "
+          f"{'ALLOCATION COUNT' if chunks_mode else 'FOOTPRINT'} ({args.store_out}) ===  mean±std")
+    print(f"{'GiB':>5}{'chunks':>7}{'foot_GB':>9}{'susp_s':>9}{'store_s':>9}{'load_s':>9}{'res_s':>9}"
           f"{'RT_s':>9}{'RT_J':>10}")
     pts = []
-    for gb, cyc in rows:
+    for gb, chunks, cyc in rows:
         foot, _ = msd([c["suspend"].extra.get("gpu_freed_bytes", 0) / 1e9 for c in cyc])
         sl, _ = msd(leg_lat(cyc, "suspend"))
         stl, _ = msd(leg_lat(cyc, "store"))
@@ -174,17 +190,23 @@ def main() -> None:
         rt_e_vals = [sum(cpu_abs(c[k]) + gpu_abs(c[k]) for k in ("suspend", "store", "load", "resume") if c.get(k))
                      for c in cyc]
         rt_e, rt_es = msd(rt_e_vals)
-        print(f"{gb:5.0f}{foot:9.1f}{sl:9.2f}{stl:9.2f}{ldl:9.2f}{rl:9.2f}{rt_l:9.2f}{rt_e:10.0f}")
-        pts.append((foot, rt_l, rt_e))
+        print(f"{gb:5.0f}{chunks:7d}{foot:9.1f}{sl:9.2f}{stl:9.2f}{ldl:9.2f}{rl:9.2f}{rt_l:9.2f}{rt_e:10.0f}")
+        # x-axis is chunk count (allocation-structure probe) or footprint
+        pts.append((chunks if chunks_mode else foot, sl, rl, rt_l, rt_e))
 
     if len(pts) >= 2:
-        S = [p[0] for p in pts]
-        aL, bL = lstsq(S, [p[1] for p in pts])
-        aE, bE = lstsq(S, [p[2] for p in pts])
-        print(f"\nAffine fit (round-trip = suspend+store+load+resume):")
-        print(f"  latency:  {aL:.2f} s + {bL:.3f} s/GB · S")
-        print(f"  energy:   {aE:.0f} J + {bE:.1f} J/GB · S   (host+GPU, store/load on {args.store_out})")
-        print(f"  -> map any workload's footprint S to its temporal round-trip cost.")
+        X = [p[0] for p in pts]
+        xname = "alloc" if chunks_mode else "GB"
+        aS, bS = lstsq(X, [p[1] for p in pts])      # suspend latency vs x (per-allocation overhead)
+        aR, bR = lstsq(X, [p[2] for p in pts])      # resume latency vs x
+        aL, bL = lstsq(X, [p[3] for p in pts])
+        aE, bE = lstsq(X, [p[4] for p in pts])
+        print(f"\nAffine fit vs {xname}:")
+        if chunks_mode:
+            print(f"  suspend:  {aS:.2f} s + {bS*1000:.2f} ms/alloc   (per-allocation cuda-checkpoint overhead)")
+            print(f"  resume:   {aR:.2f} s + {bR*1000:.2f} ms/alloc")
+        print(f"  round-trip latency:  {aL:.2f} s + {bL:.4f} s/{xname}")
+        print(f"  round-trip energy:   {aE:.0f} J + {bE:.2f} J/{xname}   (host+GPU, {args.store_out})")
     print("Raw per-op records -> data/timed_dump.jsonl")
 
 
