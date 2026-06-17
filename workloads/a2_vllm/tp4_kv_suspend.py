@@ -97,32 +97,27 @@ def w_swap_in(worker):
 
 def w_store(worker, store_dir):
     import os as _os
+    import torch
     path = _os.path.join(store_dir, f"a2kv_rank{getattr(worker,'rank',0)}.bin")
     worker._kv_path = path
     tot = 0
     with open(path, "wb", buffering=0) as f:
-        for h in worker._kv_host:
-            b = h.contiguous().view(torch.uint8).numpy().tobytes()
-            f.write(b); tot += len(b)
+        for h in worker._kv_host:                       # bf16 -> flat uint8 (numpy has no bf16)
+            arr = h.contiguous().reshape(-1).view(torch.uint8).numpy()
+            arr.tofile(f); tot += arr.nbytes
     _os.sync()
     return tot
 
 
 def w_load(worker):
     import os as _os
-    import numpy as np
     import torch
-    try:
-        _os.system("sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null")
-    except Exception:
-        pass
-    path = worker._kv_path
-    with open(path, "rb", buffering=0) as f:
+    _os.system("sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null")
+    with open(worker._kv_path, "rb", buffering=0) as f:
         for h in worker._kv_host:
-            nbytes = h.numel() * h.element_size()
-            buf = f.read(nbytes)
-            flat = torch.frombuffer(bytearray(buf), dtype=torch.uint8)
-            h.contiguous().view(torch.uint8).copy_(flat)
+            hb = h.contiguous().reshape(-1).view(torch.uint8)   # view into h's storage
+            buf = f.read(hb.numel())
+            hb.copy_(torch.frombuffer(bytearray(buf), dtype=torch.uint8))
     return 1
 
 
