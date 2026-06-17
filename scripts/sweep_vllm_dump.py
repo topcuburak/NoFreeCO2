@@ -114,6 +114,8 @@ def main() -> None:
     ap.add_argument("--tag", default=None, help="tag written into each record (e.g. a2_tp1_nvme) "
                     "to separate this run in data/timed_dump.jsonl")
     args = ap.parse_args()
+    drive_w = 3.0 if "home" in (args.store_out or "") else 50.0   # SATA 3 W / NVMe 50 W
+    print(f"[sweep] modeled drive {drive_w} W (store_out={args.store_out})")
 
     pf = td.preflight(argparse.Namespace(cc_bin=None, criu_bin=None))
     if pf["problems"]:
@@ -159,7 +161,7 @@ def main() -> None:
                             tele, pf["cuda_checkpoint"], pf["criu"], pids,
                             out_dir=args.store_out, mark_min=ci * 1000 + cyc, baseline=args.baseline,
                             keep_images=False, skip_criu=True, store=True, store_out=args.store_out,
-                            tag=args.tag))
+                            drive_w=drive_w, tag=args.tag))
                     except Exception as e:
                         print(f"[sweep] config {ci} cycle {cyc + 1} FAILED: {type(e).__name__}: {e}")
                     if cyc < args.cycles - 1:
