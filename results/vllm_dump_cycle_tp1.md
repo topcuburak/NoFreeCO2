@@ -21,6 +21,21 @@ So real vLLM (thousands of KV/weight tensors) costs the same as synthetic `hold_
 footprint — no serving-specific or allocation-structure premium (cf. the chunks probe). Mechanism cost
 = `a + b·S`, total bytes only, validated on BOTH training (A1) and serving (A2). Raw: `a2_tp1_nvme`.
 
+### Both tiers — NVMe vs SATA (tag `a2_tp1_sata`, robust floor)
+| leg | NVMe (38.4 GB) | SATA (39.2 GB) |
+|---|---|---|
+| suspend | 7.42 s (5.18 GB/s) | 7.55 s (5.19 GB/s) — tier-independent ✓ |
+| store | 6.62 s (5.80 GB/s) | 84.41 s (0.46 GB/s) |
+| load | 3.18 s (12.07 GB/s) | 77.84 s (0.50 GB/s) |
+| resume | 2.84 s (13.53 GB/s) | 2.87 s (13.65 GB/s) — tier-independent ✓ |
+| **round-trip** | **20.05 s / 5.25 kJ** (137 J/GB) | **172.67 s / 35.54 kJ** (907 J/GB) |
+
+**NVMe→SATA flip: 8.6× latency, 6.8× energy** — matches A1 (8.8×) and S1 (8.3×); real serving
+reproduces the storage-tier sensitivity. GPU legs identical across tiers (cuda-checkpoint never touches
+disk); storage legs match the standalone sweep (NVMe 5.8/12.7, SATA 0.48/0.53 GB/s) to two digits. On
+SATA, store+load are 92% of the energy — the GPU idles ~160 s/cycle while the slow disk grinds (the
+idle-hold-dominates regime). A2 TP=1 closed on both tiers.
+
 ---
 ## (older, cpu_abs-only sweep — SUPERSEDED by the FULL-energy run above)
 
