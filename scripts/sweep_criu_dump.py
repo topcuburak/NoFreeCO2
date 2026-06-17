@@ -64,15 +64,15 @@ def criu_restore(criu, img):
     return 1
 
 
-def hold_pid():
-    out = subprocess.run(["pgrep", "-f", "hold_dram.py"], capture_output=True, text=True).stdout.split()
+def hold_pid(pat):
+    out = subprocess.run(["pgrep", "-f", pat], capture_output=True, text=True).stdout.split()
     return int(out[0]) if out else None
 
 
-def wait_resident(min_bytes, timeout=120):
+def wait_resident(min_bytes, pat, timeout=120):
     dl = time.monotonic() + timeout
     while time.monotonic() < dl:
-        pid = hold_pid()
+        pid = hold_pid(pat)
         if pid:
             try:
                 for line in open(f"/proc/{pid}/status"):
@@ -81,7 +81,7 @@ def wait_resident(min_bytes, timeout=120):
             except OSError:
                 pass
         time.sleep(1)
-    return hold_pid()
+    return hold_pid(pat)
 
 
 def main() -> None:
@@ -93,14 +93,18 @@ def main() -> None:
     ap.add_argument("--baseline", type=float, default=5.0)
     ap.add_argument("--tag", default="s2_criu_nvme")
     ap.add_argument("--criu-bin", default=None)
+    ap.add_argument("--target", default="work_dram.py",
+                    help="target script in scripts/: work_dram.py (ACTIVE compute, default) or "
+                         "hold_dram.py (idle). Must take --gb --seconds.")
     args = ap.parse_args()
     if os.geteuid() != 0:
         raise SystemExit("[s2] run as root (sudo -E) -- criu needs CAP_SYS_ADMIN + RAPL")
     criu = _resolve_criu(args.criu_bin)
     drive_w = 3.0 if "home" in args.store_out else 50.0
-    hold_py = os.path.join(_REPO, "scripts", "hold_dram.py")
+    target_py = os.path.join(_REPO, "scripts", args.target)
+    pat = args.target
     sizes = [float(s) for s in args.sizes.split(",") if s.strip()]
-    print(f"[s2] criu={criu} drive_w={drive_w} store_out={args.store_out} sizes={sizes}")
+    print(f"[s2] criu={criu} target={args.target} drive_w={drive_w} store_out={args.store_out} sizes={sizes}")
 
     tele = build_telemetry(nvml_gpus=[])                     # CPU domain: exclude GPU
     tele.start()
@@ -121,11 +125,12 @@ def main() -> None:
     try:
         for gb in sizes:
             img = os.path.join(args.store_out, "criu_s2_img")
-            proc = subprocess.Popen([sys.executable, hold_py, "--gb", str(gb), "--seconds", "100000"],
-                                    start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            pid = wait_resident(gb * (1024 ** 3) * 0.9)
+            wlog = open(f"/tmp/s2_{args.target}_{gb:g}gb.log", "w")  # capture arr[0] continuity
+            proc = subprocess.Popen([sys.executable, target_py, "--gb", str(gb), "--seconds", "100000"],
+                                    start_new_session=True, stdout=wlog, stderr=subprocess.STDOUT)
+            pid = wait_resident(gb * (1024 ** 3) * 0.9, pat)
             if not pid:
-                print(f"[s2] {gb}GB: hold_dram not resident -- skip"); continue
+                print(f"[s2] {gb}GB: {args.target} not resident -- skip"); continue
             print(f"\n[s2] ===== {gb} GiB, PID={pid} =====", flush=True)
             for c in range(args.cycles):
                 shutil.rmtree(img, ignore_errors=True); os.makedirs(img, exist_ok=True)
@@ -141,7 +146,7 @@ def main() -> None:
                 try: proc.wait(timeout=5)                    # reap our child so criu can reuse the PID
                 except Exception: pass
                 for _ in range(20):
-                    if hold_pid() is None: break
+                    if hold_pid(pat) is None: break
                     time.sleep(0.5)
                 try:
                     rec_r = measure_operation(tele, workload="timed_dump", operation="criu_restore",
@@ -150,9 +155,9 @@ def main() -> None:
                     emit(rec_r, "restore", gb, c)
                 except Exception as e:
                     print(f"[s2] {gb}GB cyc{c} RESTORE failed: {e}"); break
-                pid = wait_resident(gb * (1024 ** 3) * 0.9, timeout=30) or hold_pid()
+                pid = wait_resident(gb * (1024 ** 3) * 0.9, pat, timeout=30) or hold_pid(pat)
                 print(f"[s2] {gb}GB cycle {c} done (pid now {pid})", flush=True)
-            subprocess.run(["pkill", "-9", "-f", "hold_dram.py"])
+            subprocess.run(["pkill", "-9", "-f", pat])
             time.sleep(2); shutil.rmtree(img, ignore_errors=True)
     finally:
         tele.stop()
