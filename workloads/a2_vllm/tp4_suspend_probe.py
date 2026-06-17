@@ -33,6 +33,9 @@ import time
 # executor so the 4 workers are separate, checkpointable PIDs.)
 os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
 os.environ.setdefault("VLLM_ATTENTION_BACKEND", "FLASH_ATTN")
+# collective_rpc ships a Python callable to the workers; the default msgpack serializer rejects
+# functions, so allow the pickle/cloudpickle fallback (single-node, our own code -> safe).
+os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
 
 
 # ---- functions shipped to each worker via collective_rpc (worker passed as 1st arg) ----
