@@ -52,7 +52,12 @@ def criu_dump(criu, pid, img):
                        capture_output=True, text=True)
     if r.returncode != 0:
         raise RuntimeError("criu dump rc=%d: %s" % (r.returncode, (r.stderr or r.stdout or "")[-600:]))
-    return dir_size(img)
+    os.sync()                                               # FLUSH the image to disk (else dump
+    return dir_size(img)                                    # returns at page-cache speed, not the tier)
+
+
+def drop_caches():
+    os.system("sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null")   # untimed: force cold restore
 
 
 def criu_restore(criu, img):
@@ -148,6 +153,7 @@ def main() -> None:
                 for _ in range(20):
                     if hold_pid(pat) is None: break
                     time.sleep(0.5)
+                drop_caches()                                # untimed: evict the image -> cold read
                 try:
                     rec_r = measure_operation(tele, workload="timed_dump", operation="criu_restore",
                         state_bytes=int(gb * 1e9), baseline_seconds=args.baseline,
