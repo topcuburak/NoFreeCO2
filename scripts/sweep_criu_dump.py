@@ -130,14 +130,17 @@ def main() -> None:
     try:
         for gb in sizes:
             img = os.path.join(args.store_out, "criu_s2_img")
-            wlog = open(f"/tmp/s2_{args.target}_{gb:g}gb.log", "w")  # capture arr[0] continuity
+            # stdout -> /dev/null: a growing log fd breaks criu restore (fd-size check); the
+            # workload stays fully active (full-array increment), we just don't capture progress.
             proc = subprocess.Popen([sys.executable, target_py, "--gb", str(gb), "--seconds", "100000"],
-                                    start_new_session=True, stdout=wlog, stderr=subprocess.STDOUT)
+                                    start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             pid = wait_resident(gb * (1024 ** 3) * 0.9, pat)
             if not pid:
                 print(f"[s2] {gb}GB: {args.target} not resident -- skip"); continue
             print(f"\n[s2] ===== {gb} GiB, PID={pid} =====", flush=True)
             for c in range(args.cycles):
+                if pid is None:
+                    print(f"[s2] {gb}GB: lost the process before cycle {c} -- stopping this size"); break
                 shutil.rmtree(img, ignore_errors=True); os.makedirs(img, exist_ok=True)
                 try:
                     rec_d = measure_operation(tele, workload="timed_dump", operation="criu_dump",
@@ -146,8 +149,9 @@ def main() -> None:
                     emit(rec_d, "dump", gb, c, dir_size(img))
                 except Exception as e:
                     print(f"[s2] {gb}GB cyc{c} DUMP failed: {e}"); break
-                try: os.kill(pid, 9)
-                except OSError: pass
+                if pid:
+                    try: os.kill(pid, 9)
+                    except OSError: pass
                 try: proc.wait(timeout=5)                    # reap our child so criu can reuse the PID
                 except Exception: pass
                 for _ in range(20):
