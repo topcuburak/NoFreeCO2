@@ -22,7 +22,10 @@ import time
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--batch", type=int, default=32)
+    ap.add_argument("--model", default="vit_large_patch16_224",
+                    help="timm model name: vit_large_patch16_224 / vit_huge_patch14_224 / "
+                         "vit_giant_patch14_224 (bigger weights+optimizer). Scales the FIXED footprint.")
+    ap.add_argument("--batch", type=int, default=32, help="scales activation footprint ~linearly")
     ap.add_argument("--img-size", type=int, default=224)
     ap.add_argument("--seconds", type=int, default=100000)
     ap.add_argument("--report-every", type=float, default=10.0)
@@ -34,15 +37,17 @@ def main() -> None:
     dev = torch.device("cuda:0")
     torch.cuda.set_device(dev)
 
-    # ViT-Large/16 -- timm if available (closest to the canonical pretraining model), else torchvision.
+    # timm if available (any ViT size); else torchvision for the two it ships.
     try:
         import timm
-        model = timm.create_model("vit_large_patch16_224", pretrained=False, num_classes=1000)
-        src = "timm vit_large_patch16_224"
+        model = timm.create_model(args.model, pretrained=False, num_classes=1000,
+                                  img_size=args.img_size)
+        src = f"timm {args.model}"
     except Exception:
         import torchvision
-        model = torchvision.models.vit_l_16(weights=None, image_size=args.img_size)
-        src = "torchvision vit_l_16"
+        tv = {"vit_huge_patch14_224": "vit_h_14"}.get(args.model, "vit_l_16")
+        model = getattr(torchvision.models, tv)(weights=None, image_size=args.img_size)
+        src = f"torchvision {tv}"
     model = model.to(dev)
     opt = torch.optim.AdamW(model.parameters(), lr=1e-4)
     loss_fn = nn.CrossEntropyLoss()
