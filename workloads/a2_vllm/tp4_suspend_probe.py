@@ -27,6 +27,13 @@ import argparse
 import os
 import time
 
+# Same vLLM workarounds the TP=1 sweep uses: the default FlashInfer sampler JIT-compiles a
+# CUDA kernel at runtime (needs nvcc, absent here) -> disable it; pin the attention backend.
+# Set before importing vLLM. (Do NOT disable V1 multiprocessing -- TP=4 needs the multiproc
+# executor so the 4 workers are separate, checkpointable PIDs.)
+os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
+os.environ.setdefault("VLLM_ATTENTION_BACKEND", "FLASH_ATTN")
+
 
 # ---- functions shipped to each worker via collective_rpc (worker passed as 1st arg) ----
 def worker_info(worker):
