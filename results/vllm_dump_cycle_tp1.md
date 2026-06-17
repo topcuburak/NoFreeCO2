@@ -1,4 +1,28 @@
-# vLLM TP=1 transparent dump/restore cycle (appendix data)
+# vLLM TP=1 transparent dump/restore cycle
+
+## FINAL — 10-cycle FULL-energy (2026-06-16, NVMe, tag `a2_tp1_nvme`)
+Real vLLM TP=1 Llama-3.1-8B serving (util 0.9 → KV pool fills the card), 10 in-place
+suspend→store→load→resume cycles via `tde.dump_and_resume` (same FULL-energy path as A1/S1:
+measured GPU board+CPU pkg + modeled DRAM/drive). Robust floor (3 fastest of 10, drops cold + stall
+tail). **Footprint 38.4 GB.** This supersedes the cpu_abs-only sweep below.
+
+| leg | latency | rate | measured GPU+CPU | FULL |
+|---|---|---|---|---|
+| suspend HBM→host | 7.42 s | 5.18 GB/s | 1.80 kJ | 1.89 kJ |
+| store host→NVMe | 6.62 s | 5.80 GB/s | 1.36 kJ | 1.78 kJ |
+| load NVMe→host | 3.18 s | 12.07 GB/s | 0.65 kJ | 0.85 kJ |
+| resume host→HBM | 2.84 s | 13.53 GB/s | 0.69 kJ | 0.73 kJ |
+| **round-trip** | **20.05 s** | | | **5.25 kJ** |
+
+**Validates the footprint-driven model on real serving** — A2 vs S1 fit at 38 GB: suspend −11%,
+store +1%, load −0% (match); resume −27% but that's ~1 s absolute and resume is the stall-tail leg
+(S1's 1.23 s intercept is inflated), so within noise. suspend 5.18 GB/s ≈ S1 5.10 ≈ A1 clean 5.47.
+So real vLLM (thousands of KV/weight tensors) costs the same as synthetic `hold_gpu` at matched
+footprint — no serving-specific or allocation-structure premium (cf. the chunks probe). Mechanism cost
+= `a + b·S`, total bytes only, validated on BOTH training (A1) and serving (A2). Raw: `a2_tp1_nvme`.
+
+---
+## (older, cpu_abs-only sweep — SUPERSEDED by the FULL-energy run above)
 
 **Testbed:** ford (1× A100-40GB, PCIe Gen4, PM1733 RAID-0 NVMe @ /var/data).
 **Date:** 2026-06-02. **Model:** meta-llama/Llama-3.1-8B, TP=1, `--enforce-eager`,
