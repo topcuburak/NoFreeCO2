@@ -113,6 +113,11 @@ def main() -> None:
     ap.add_argument("--cycle-gap", type=float, default=5.0, help="serve-resume gap between cycles")
     ap.add_argument("--tag", default=None, help="tag written into each record (e.g. a2_tp1_nvme) "
                     "to separate this run in data/timed_dump.jsonl")
+    ap.add_argument("--serve-repeat", type=int, default=2000,
+                    help="serve.py --repeat: prompt-set repeats. serve.py RENDERS all "
+                         "(repeat x num_prompts) requests on CPU before generating, so a huge value "
+                         "(was 100000 -> 1.6M -> ~9 min render) stalls the readiness gate. 2000 keeps "
+                         "vLLM serving for hours but renders in seconds.")
     args = ap.parse_args()
     drive_w = 3.0 if "home" in (args.store_out or "") else 50.0   # SATA 3 W / NVMe 50 W
     print(f"[sweep] modeled drive {drive_w} W (store_out={args.store_out})")
@@ -131,7 +136,7 @@ def main() -> None:
 
     for ci, cfg in enumerate(configs):
         cmd = ([sys.executable, serve_py, "--model", args.model,
-                "--tensor-parallel-size", "1", "--enforce-eager", "--repeat", "100000"]
+                "--tensor-parallel-size", "1", "--enforce-eager", "--repeat", str(args.serve_repeat)]
                + args.base.split() + cfg.split())
         print(f"\n[sweep] === config {ci}: {cfg} ===")
         print(f"[sweep] launch: {' '.join(cmd)}")
