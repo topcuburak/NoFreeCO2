@@ -109,19 +109,30 @@ def w_store(worker, store_dir):
     return tot
 
 
+def w_drop(worker):
+    import os as _os                                        # UNTIMED cold-cache setup (sync flushes
+    _os.system("sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null")  # store's dirty pages, not load)
+    return 1
+
+
 def w_load(worker):
     import os as _os
     import torch
-    _os.system("sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null")
-    with open(worker._kv_path, "rb", buffering=0) as f:
+    fd = _os.open(worker._kv_path, _os.O_RDONLY)
+    try:
+        try: _os.posix_fadvise(fd, 0, 0, _os.POSIX_FADV_SEQUENTIAL)   # aggressive readahead
+        except Exception: pass
+        f = _os.fdopen(fd, "rb", buffering=0, closefd=False)
         for h in worker._kv_host:
             mv = memoryview(h.contiguous().reshape(-1).view(torch.uint8).numpy())  # into pinned buf
-            got = 0                                          # read straight into the buffer, no copies
+            got = 0
             while got < len(mv):
                 r = f.readinto(mv[got:])
                 if not r:
                     break
                 got += r
+    finally:
+        _os.close(fd)
     return 1
 
 
@@ -190,6 +201,8 @@ def main() -> None:
     try:
         for c in range(args.cycles):
             for phase, fn, fargs in legs:
+                if phase == "load":
+                    llm.collective_rpc(w_drop)               # untimed: drop caches for a cold read
                 rec = measure_operation(
                     tele, workload="timed_dump", operation=f"kv_{phase}",
                     state_bytes=int(kv_total_gb * 1e9), baseline_seconds=args.baseline,
