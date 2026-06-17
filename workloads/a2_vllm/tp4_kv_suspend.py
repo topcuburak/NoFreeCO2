@@ -115,9 +115,13 @@ def w_load(worker):
     _os.system("sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null")
     with open(worker._kv_path, "rb", buffering=0) as f:
         for h in worker._kv_host:
-            hb = h.contiguous().reshape(-1).view(torch.uint8)   # view into h's storage
-            buf = f.read(hb.numel())
-            hb.copy_(torch.frombuffer(bytearray(buf), dtype=torch.uint8))
+            mv = memoryview(h.contiguous().reshape(-1).view(torch.uint8).numpy())  # into pinned buf
+            got = 0                                          # read straight into the buffer, no copies
+            while got < len(mv):
+                r = f.readinto(mv[got:])
+                if not r:
+                    break
+                got += r
     return 1
 
 
