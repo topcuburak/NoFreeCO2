@@ -53,5 +53,37 @@ cost tracks the DUMPED bytes either way — confirming the cost driver is what c
 serializes (caching-allocator reserved high-water), not the framework's live-tensor accounting.
 
 ## A5 — HACC cosmology — PENDING
-## A5 — HACC cosmology — PENDING
-## A6 — gem5 SPEC CPU2017 (CPU/criu) — PENDING
+## A5 — graph analytics (GAPBS PageRank), memory-extreme CPU, criu
+`gapbs/pr` (Kronecker graph, OpenMP across all 64 threads / 4 NUMA nodes), checkpointed with criu
+via `scripts/sweep_criu_dump.py --launch`. The CPU/host-domain counterpart to the GPU mechanisms,
+and the paper's memory-extreme + real-CPU validation point (backs the synthetic S2). Footprint dialed
+by graph scale: RSS ≈ 8 bytes × (2^scale × degree). Two footprints; energy = measured CPU pkg (RAPL)
++ modeled DRAM (0.3 W/GB) + modeled drive (NVMe 50 / SATA 3 W). 5 cycles, robust floor (drop cold).
+
+**Tier comparison at 71 GB** (scale 29; SATA-safe — image < 140 GB free on `/`):
+| leg | NVMe | SATA | flip |
+|---|---|---|---|
+| dump | 36.9 s / 8.18 kJ (1.92 GB/s) | 157.6 s / 35.2 kJ (0.45 GB/s) | 4.3× |
+| restore | 13.4 s / 2.98 kJ (5.29 GB/s) | 154.1 s / 24.6 kJ (0.46 GB/s) | 11.5× |
+| **round-trip** | **50.3 s / 11.16 kJ** (157 J/GB) | **311.7 s / 59.8 kJ** (843 J/GB) | **6.2× / 5.4×** |
+
+**Memory-extreme, NVMe only at 279 GB** (scale 30, degree 32): dump 167.4 s / 46.2 kJ (1.67 GB/s),
+restore 85.9 s / 23.7 kJ (3.25 GB/s); **round-trip 253 s / 69.9 kJ** (250 J/GB). A quarter-terabyte
+64-thread process checkpointed and restored 5×.
+
+**The criu regime, measured (the cross-cutting contrast with A1–A4):**
+- **NVMe = overhead-bound:** dump 1.92, restore 5.29 GB/s — both well under raw NVMe (5.8 / 12.7).
+  The criu page-walk + thread-freeze caps throughput, not the disk.
+- **SATA = bandwidth-bound:** 0.45 / 0.46 GB/s = raw SATA, and dump ≈ restore (symmetric — the drive
+  sets the time).
+- **Tier flip is MUTED: 5.4× energy / 6.2× latency** vs the GPU mechanisms' 8–11×. Because criu cannot
+  exploit NVMe's full bandwidth, the NVMe leg is "slow," shrinking the gap to bandwidth-bound SATA.
+  The dump leg shows it cleanest (4.3×). This validates S2's synthetic muted-flip finding with a real
+  64-thread graph workload, at 9× the footprint S2 reached.
+- **Energy split inverts vs GPU:** CPU pkg dominates (idle/compute hold), DRAM grows with footprint×time
+  (9% at 71 GB → 28% at 279 GB), drive is small. The GPU mechanisms are GPU-board-dominated; criu is
+  CPU-hold-dominated. Same "slow-tier cost = the processor waiting, not the disk" pattern as A1.
+
+Tags `a5_graph_nvme` (2×5 cyc), `a5_graph_sata2`, `a5_graph_big_nvme`.
+
+## A6 — gem5 (big-RSS single process) + NPB (multi-core), CPU/criu — PENDING
