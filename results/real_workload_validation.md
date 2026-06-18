@@ -28,6 +28,30 @@ Note worth keeping: `gpu_alloc` (PyTorch live, 7.72 GB) ≠ dumped footprint (NV
 the activation high-water is reserved-but-mostly-free between steps, yet cuda-checkpoint dumps all of it.
 Same effect seen in A1 (training reserves the backward-activation peak).
 
-## A4 — DLRMv2 training (memory-extreme, embedding-dominated) — PENDING
+## A4 — DLRM training (memory-extreme, embedding-dominated, transparent cuda-checkpoint)
+`workloads/a4_dlrm/dlrm_train.py` (sparse embedding 30 GiB + bottom/top MLP, batch 2048, plain SGD).
+Single process, no NCCL. **Footprint 32.8 GB** = 32.2 GB resident embedding + ~0.6 GB CUDA context.
+5 cycles, variance <1%, no drift (the cold cycle is not even an outlier here).
+
+| leg | NVMe | SATA |
+|---|---|---|
+| suspend | 6.41 s (5.13 GB/s) | 6.39 s (tier-indep ✓) |
+| store | 6.34 s (5.18 GB/s) | 72.0 s (0.46 GB/s) |
+| load | 2.81 s (11.7 GB/s) | 66.0 s (0.50 GB/s) |
+| resume | 2.56 s | 2.57 s (tier-indep ✓) |
+| **round-trip** | **18.1 s / 4.70 kJ** (143 J/GB) | **147 s / 36.4 kJ** (1107 J/GB) |
+
+**Validates the model:** S1 fit predicts suspend 0.79 + 0.196×32.8 = **7.2 s**, A4 measured **6.4 s**;
+suspend 5.13 GB/s = S1 5.1 = A3 5.07; store/load match the tier sweep; NVMe→SATA flip **8.1×/7.7×**;
+energy/byte 143 J/GB ≈ A3's 136 (workload-independent). Tags `a4_dlrm_nvme`/`a4_dlrm_sata`.
+
+**The A4 contrast (why DLRM was worth running):** the dumped image (32.8 GB) ≈ the resident embedding
+(32.2 GB) — the gap is just the CUDA context, with NO reserved-activation slack. This is the MIRROR of
+A3, where 7.72 GB live ballooned to a 35.2 GB dumped image (27 GB of reserved activation peak). So the
+dumped footprint spans ≈live (embedding-bound DLRM) to ≫live (activation-bound ViT), and the mechanism
+cost tracks the DUMPED bytes either way — confirming the cost driver is what cuda-checkpoint actually
+serializes (caching-allocator reserved high-water), not the framework's live-tensor accounting.
+
+## A5 — HACC cosmology — PENDING
 ## A5 — HACC cosmology — PENDING
 ## A6 — gem5 SPEC CPU2017 (CPU/criu) — PENDING
