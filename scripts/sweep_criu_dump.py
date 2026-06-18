@@ -49,7 +49,8 @@ def dir_size(p):
 
 def criu_dump(criu, pid, img):
     r = subprocess.run([criu, "dump", "-t", str(pid), "-D", img,
-                        "--leave-running", "--file-locks", "--shell-job"],
+                        "--leave-running", "--file-locks", "--shell-job",
+                        "--tcp-established", "--ext-unix-sk"],   # MPI wireup: loopback TCP + unix sk
                        capture_output=True, text=True)
     if r.returncode != 0:
         raise RuntimeError("criu dump rc=%d: %s" % (r.returncode, (r.stderr or r.stdout or "")[-600:]))
@@ -63,7 +64,8 @@ def drop_caches():
 
 def criu_restore(criu, img):
     r = subprocess.run([criu, "restore", "-D", img,
-                        "--restore-detached", "--file-locks", "--shell-job"],
+                        "--restore-detached", "--file-locks", "--shell-job",
+                        "--tcp-established", "--ext-unix-sk"],
                        capture_output=True, text=True)
     if r.returncode != 0:
         raise RuntimeError("criu restore rc=%d: %s" % (r.returncode, (r.stderr or r.stdout or "")[-600:]))
