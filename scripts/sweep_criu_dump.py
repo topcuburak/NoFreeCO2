@@ -101,16 +101,52 @@ def rss_of(pid):
     return None
 
 
-def tree_rss(pat, want_comm=None):
-    return sum(rss_of(p) or 0 for p in all_pids(pat, want_comm))   # sum the whole process tree
+def _children_map():
+    m = {}
+    for d in os.listdir("/proc"):
+        if not d.isdigit():
+            continue
+        try:
+            data = open(f"/proc/{d}/stat").read()
+            ppid = int(data[data.rindex(")") + 2:].split()[1])   # field after comm: state, PPID
+        except (OSError, ValueError, IndexError):
+            continue
+        m.setdefault(ppid, []).append(int(d))
+    return m
+
+
+def subtree(root):
+    if not root:
+        return []
+    m = _children_map()
+    seen, stack = [], [root]
+    while stack:
+        p = stack.pop()
+        if p in seen:
+            continue
+        seen.append(p)
+        stack.extend(m.get(p, []))
+    return seen                                       # root + all descendants (mixed comm ok)
+
+
+def tree_rss(root):
+    return sum(rss_of(p) or 0 for p in subtree(root))
+
+
+def group_alive(pgid):
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except OSError:
+        return False
 
 
 def wait_resident(min_bytes, pat, timeout=120, want_comm=None):
     dl = time.monotonic() + timeout
     while time.monotonic() < dl:
-        pids = all_pids(pat, want_comm)
-        if pids and sum(rss_of(p) or 0 for p in pids) >= min_bytes:   # footprint may span children
-            return pids[0]
+        root = hold_pid(pat, want_comm)              # tree root, found by its (unique) comm
+        if root and tree_rss(root) >= min_bytes:     # footprint may span the whole descendant tree
+            return root
         time.sleep(1)
     return hold_pid(pat, want_comm)
 
@@ -191,7 +227,7 @@ def main() -> None:
                 if pid is None:
                     print(f"[s2] {gb}GB: lost the process before cycle {c} -- stopping this size"); break
                 shutil.rmtree(img, ignore_errors=True); os.makedirs(img, exist_ok=True)
-                rss = tree_rss(pat, want_comm)               # whole-tree resident bytes at dump time
+                rss = tree_rss(pid)                          # whole-tree resident bytes at dump time
                 try:
                     rec_d = measure_operation(tele, workload="timed_dump", operation="criu_dump",
                         state_bytes=int(rss or gb * 1e9), baseline_seconds=args.baseline,
@@ -199,19 +235,20 @@ def main() -> None:
                     emit(rec_d, "dump", gb, c, dir_size(img), rss)
                 except Exception as e:
                     print(f"[s2] {gb}GB cyc{c} DUMP failed: {e}"); break
-                if pid:                                       # kill the whole GROUP (multi-process tree):
-                    try: os.killpg(os.getpgid(pid), 9)        # leaving children alive would orphan them
-                    except OSError:                           # and collide pids on restore
-                        try: os.kill(pid, 9)
-                        except OSError: pass
+                try: pgid = os.getpgid(pid)                   # kill the whole GROUP (multi-process tree):
+                except OSError: pgid = pid                    # leaving children alive orphans them and
+                try: os.killpg(pgid, 9)                       # collides pids on restore
+                except OSError:
+                    try: os.kill(pid, 9)
+                    except OSError: pass
                 try: proc.wait(timeout=2)                    # reap our child (cycle 0) so the PID frees
                 except Exception: pass
                 gone = False                                  # criu restore reclaims the ORIGINAL pids +
                 for _ in range(240):                          # every TID; a lingering zombie (slow 64-
-                    if not all_pids(pat, want_comm):          # thread SIGKILL under load) holds a pid ->
-                        gone = True; break                    # 'fork: File exists'. Block until the WHOLE
-                    try: proc.wait(timeout=0.5)               # tree (parent + every forked child) is gone.
-                    except Exception: pass
+                    if not group_alive(pgid) and not os.path.exists(f"/proc/{pid}"):   # thread SIGKILL
+                        gone = True; break                    # under load) holds a pid -> 'fork: File
+                    try: proc.wait(timeout=0.5)               # exists'. Block until the WHOLE group
+                    except Exception: pass                    # (parent + every child) is gone.
                     time.sleep(0.5)
                 if not gone:
                     print(f"[s2] {gb}GB cyc{c}: pid {pid} would not exit -- skip restore"); break
