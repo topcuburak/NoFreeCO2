@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -74,6 +75,16 @@ def hold_pid(pat):
     return int(out[0]) if out else None
 
 
+def rss_of(pid):
+    try:
+        for line in open(f"/proc/{pid}/status"):
+            if line.startswith("VmRSS:"):
+                return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    return None
+
+
 def wait_resident(min_bytes, pat, timeout=120):
     dl = time.monotonic() + timeout
     while time.monotonic() < dl:
@@ -101,26 +112,34 @@ def main() -> None:
     ap.add_argument("--target", default="work_dram.py",
                     help="target script in scripts/: work_dram.py (ACTIVE compute, default) or "
                          "hold_dram.py (idle). Must take --gb --seconds.")
+    ap.add_argument("--launch", default=None,
+                    help="full command to launch the workload instead of the python --target "
+                         "(e.g. a GAPBS binary). The process it spawns IS the criu target.")
+    ap.add_argument("--pat", default=None,
+                    help="pgrep pattern for the RSS-holding PID (defaults to --target). Required "
+                         "with --launch so we find/kill the right process.")
+    ap.add_argument("--wait-timeout", type=int, default=120,
+                    help="seconds to wait for the workload to reach footprint (bump for big graphs)")
     args = ap.parse_args()
     if os.geteuid() != 0:
         raise SystemExit("[s2] run as root (sudo -E) -- criu needs CAP_SYS_ADMIN + RAPL")
     criu = _resolve_criu(args.criu_bin)
     drive_w = 3.0 if "home" in args.store_out else 50.0
     target_py = os.path.join(_REPO, "scripts", args.target)
-    pat = args.target
+    pat = args.pat or args.target
     sizes = [float(s) for s in args.sizes.split(",") if s.strip()]
     print(f"[s2] criu={criu} target={args.target} drive_w={drive_w} store_out={args.store_out} sizes={sizes}")
 
     tele = build_telemetry(nvml_gpus=[])                     # CPU domain: exclude GPU
     tele.start()
 
-    def emit(rec, phase, gb, c, img_bytes=None):
+    def emit(rec, phase, gb, c, img_bytes=None, rss_bytes=None):
         dram = DRAM_W_PER_GB * gb * rec.latency_s
         drive = drive_w * rec.latency_s
         meas = sum(s.energy_abs_j or 0.0 for s in rec.sources if s.name == "cpu_pkg_energy_rapl")
         rec.extra.update(mark_min=c, measured_abs_j=round(meas, 1), dram_model_j=round(dram, 1),
                          drive_model_j=round(drive, 1), full_total_j=round(meas + dram + drive, 1),
-                         footprint_gb=gb, image_bytes=img_bytes)
+                         footprint_gb=gb, image_bytes=img_bytes, rss_bytes=rss_bytes)
         rec.config.update(tag=args.tag, phase=phase, workload="s2_criu")
         print_record(rec)
         print(f"  modeled DRAM {dram:.0f} + drive {drive:.0f} | FULL (CPU+DRAM+drive): {meas+dram+drive:.0f} J",
@@ -131,10 +150,14 @@ def main() -> None:
         for gb in sizes:
             img = os.path.join(args.store_out, "criu_s2_img")
             # stdout -> /dev/null: a growing log fd breaks criu restore (fd-size check); the
-            # workload stays fully active (full-array increment), we just don't capture progress.
-            proc = subprocess.Popen([sys.executable, target_py, "--gb", str(gb), "--seconds", "100000"],
-                                    start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            pid = wait_resident(gb * (1024 ** 3) * 0.9, pat)
+            # workload stays fully active, we just don't capture progress.
+            if args.launch:                                  # arbitrary binary (e.g. GAPBS) IS the target
+                cmd = args.launch
+            else:
+                cmd = f"{sys.executable} {target_py} --gb {gb} --seconds 100000"
+            proc = subprocess.Popen(shlex.split(cmd), start_new_session=True,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            pid = wait_resident(gb * (1024 ** 3) * 0.9, pat, timeout=args.wait_timeout)
             if not pid:
                 print(f"[s2] {gb}GB: {args.target} not resident -- skip"); continue
             print(f"\n[s2] ===== {gb} GiB, PID={pid} =====", flush=True)
@@ -142,11 +165,12 @@ def main() -> None:
                 if pid is None:
                     print(f"[s2] {gb}GB: lost the process before cycle {c} -- stopping this size"); break
                 shutil.rmtree(img, ignore_errors=True); os.makedirs(img, exist_ok=True)
+                rss = rss_of(pid)                            # actual resident bytes at dump time
                 try:
                     rec_d = measure_operation(tele, workload="timed_dump", operation="criu_dump",
-                        state_bytes=int(gb * 1e9), baseline_seconds=args.baseline,
+                        state_bytes=int(rss or gb * 1e9), baseline_seconds=args.baseline,
                         op=lambda: criu_dump(criu, pid, img), config={"phase": "dump"})
-                    emit(rec_d, "dump", gb, c, dir_size(img))
+                    emit(rec_d, "dump", gb, c, dir_size(img), rss)
                 except Exception as e:
                     print(f"[s2] {gb}GB cyc{c} DUMP failed: {e}"); break
                 if pid:
