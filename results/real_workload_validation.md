@@ -86,4 +86,23 @@ restore 85.9 s / 23.7 kJ (3.25 GB/s); **round-trip 253 s / 69.9 kJ** (250 J/GB).
 
 Tags `a5_graph_nvme` (2×5 cyc), `a5_graph_sata2`, `a5_graph_big_nvme`.
 
-## A6 — gem5 (big-RSS single process) + NPB (multi-core), CPU/criu — PENDING
+## A8 — DuckDB in-memory analytics (multi-THREAD, latency-insensitive batch), criu
+`work_duck.py` (one process, 64 threads, uncompressed in-memory table, looping GROUP BY).
+The single-address-space / many-TID criu case. Footprint dialed by table rows (force_compression
+off -> RSS tracks the target). 25->150 GB sweep, both tiers, 4 cycles, robust floor.
+
+| footprint | NVMe dump | NVMe restore | SATA dump | SATA restore |
+|---|---|---|---|---|
+| 25 GB | 27.1 s / 5.51 kJ | 10.9 s / 2.20 kJ | 80.2 s / 17.7 kJ | 74.0 s / 10.8 kJ |
+| 100 GB | 51.3 s / 11.68 kJ | 20.4 s / 4.71 kJ | 247 s / 55.2 kJ | 249 s / 41.5 kJ |
+| 150 GB | 81.3 s / 19.72 kJ | 41.7 s / 10.17 kJ | (>140 GB free, NVMe only) | |
+
+- **NVMe overhead-bound** (1.4-2.0 GB/s), **SATA bandwidth-bound** (0.40-0.45 GB/s = raw SATA).
+- **Footprint-linear:** dump ≈ 1.3 kJ + 122 J/GB across 25->150 GB; restore ~half.
+- **Tier flip at 100 GB: 6.9× latency / 5.9× energy** -- matches A5 (6.2×/5.4×), the muted criu flip.
+- A real latency-insensitive batch-analytics workload lands on the same criu curve as the synthetic
+  S2 and the GAPBS A5: the multi-thread mechanism cost is footprint-driven, tier-modulated, CPU-hold
+  dominated. Tags `a8_duck_nvme` (6 pts), `a8_duck_sata` (4 pts).
+
+## A6 — gem5 (big-RSS single process), CPU/criu — PENDING
+## A7 — NPB-MPI (multi-PROCESS HPC batch), criu — PENDING (feasibility: criu over a live MPI job)
