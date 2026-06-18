@@ -70,9 +70,20 @@ def criu_restore(criu, img):
     return 1
 
 
-def hold_pid(pat):
+def _comm(pid):
+    try:
+        return open(f"/proc/{pid}/comm").read().strip()
+    except OSError:
+        return None
+
+
+def hold_pid(pat, want_comm=None):
     out = subprocess.run(["pgrep", "-f", pat], capture_output=True, text=True).stdout.split()
-    return int(out[0]) if out else None
+    me = os.getpid()
+    pids = [int(p) for p in out if int(p) != me]      # never match the driver itself
+    if want_comm:                                     # require the binary's comm (e.g. "pr"):
+        pids = [p for p in pids if _comm(p) == want_comm]   # excludes python/sudo/criu ancestors
+    return pids[0] if pids else None
 
 
 def rss_of(pid):
@@ -85,10 +96,10 @@ def rss_of(pid):
     return None
 
 
-def wait_resident(min_bytes, pat, timeout=120):
+def wait_resident(min_bytes, pat, timeout=120, want_comm=None):
     dl = time.monotonic() + timeout
     while time.monotonic() < dl:
-        pid = hold_pid(pat)
+        pid = hold_pid(pat, want_comm)
         if pid:
             try:
                 for line in open(f"/proc/{pid}/status"):
@@ -97,7 +108,7 @@ def wait_resident(min_bytes, pat, timeout=120):
             except OSError:
                 pass
         time.sleep(1)
-    return hold_pid(pat)
+    return hold_pid(pat, want_comm)
 
 
 def main() -> None:
@@ -127,6 +138,9 @@ def main() -> None:
     drive_w = 3.0 if "home" in args.store_out else 50.0
     target_py = os.path.join(_REPO, "scripts", args.target)
     pat = args.pat or args.target
+    # when launching a raw binary, require its comm (basename, 15-char kernel limit) so we never
+    # match the python driver / sudo / criu (which all carry the launch string in their argv).
+    want_comm = os.path.basename(shlex.split(args.launch)[0])[:15] if args.launch else None
     sizes = [float(s) for s in args.sizes.split(",") if s.strip()]
     print(f"[s2] criu={criu} target={args.target} drive_w={drive_w} store_out={args.store_out} sizes={sizes}")
 
@@ -157,7 +171,8 @@ def main() -> None:
                 cmd = f"{sys.executable} {target_py} --gb {gb} --seconds 100000"
             proc = subprocess.Popen(shlex.split(cmd), start_new_session=True,
                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            pid = wait_resident(gb * (1024 ** 3) * 0.9, pat, timeout=args.wait_timeout)
+            pid = wait_resident(gb * (1024 ** 3) * 0.9, pat, timeout=args.wait_timeout,
+                                want_comm=want_comm)
             if not pid:
                 print(f"[s2] {gb}GB: {args.target} not resident -- skip"); continue
             print(f"\n[s2] ===== {gb} GiB, PID={pid} =====", flush=True)
@@ -179,7 +194,7 @@ def main() -> None:
                 try: proc.wait(timeout=5)                    # reap our child so criu can reuse the PID
                 except Exception: pass
                 for _ in range(20):
-                    if hold_pid(pat) is None: break
+                    if hold_pid(pat, want_comm) is None: break
                     time.sleep(0.5)
                 drop_caches()                                # untimed: evict the image -> cold read
                 try:
@@ -189,9 +204,13 @@ def main() -> None:
                     emit(rec_r, "restore", gb, c)
                 except Exception as e:
                     print(f"[s2] {gb}GB cyc{c} RESTORE failed: {e}"); break
-                pid = wait_resident(gb * (1024 ** 3) * 0.9, pat, timeout=30) or hold_pid(pat)
+                pid = (wait_resident(gb * (1024 ** 3) * 0.9, pat, timeout=30, want_comm=want_comm)
+                       or hold_pid(pat, want_comm))
                 print(f"[s2] {gb}GB cycle {c} done (pid now {pid})", flush=True)
-            subprocess.run(["pkill", "-9", "-f", pat])
+            if want_comm:
+                subprocess.run(["pkill", "-9", "-x", want_comm])   # kill by comm, not the driver
+            else:
+                subprocess.run(["pkill", "-9", "-f", pat])
             time.sleep(2); shutil.rmtree(img, ignore_errors=True)
     finally:
         tele.stop()
