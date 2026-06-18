@@ -191,11 +191,17 @@ def main() -> None:
                 if pid:
                     try: os.kill(pid, 9)
                     except OSError: pass
-                try: proc.wait(timeout=5)                    # reap our child so criu can reuse the PID
+                try: proc.wait(timeout=2)                    # reap our child (cycle 0) so the PID frees
                 except Exception: pass
-                for _ in range(20):
-                    if hold_pid(pat, want_comm) is None: break
+                gone = False                                 # criu restore reclaims the ORIGINAL pid +
+                for _ in range(240):                         # every TID; a lingering zombie (slow 64-
+                    if pid is None or not os.path.exists(f"/proc/{pid}"):   # thread SIGKILL under load)
+                        gone = True; break                   # holds the pid -> 'fork: File exists'. Block
+                    try: proc.wait(timeout=0.5)              # until /proc/<pid> truly vanishes (group
+                    except Exception: pass                   # leader reaped => all its TIDs freed too).
                     time.sleep(0.5)
+                if not gone:
+                    print(f"[s2] {gb}GB cyc{c}: pid {pid} would not exit -- skip restore"); break
                 drop_caches()                                # untimed: evict the image -> cold read
                 try:
                     rec_r = measure_operation(tele, workload="timed_dump", operation="criu_restore",
