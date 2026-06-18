@@ -63,9 +63,12 @@ def drop_caches():
 
 
 def criu_restore(criu, img):
+    # --tcp-close: close (don't rebind) TCP on restore -- avoids the MPI OOB listener
+    # 'address already in use' (TIME_WAIT). OpenMPI uses TCP only for wireup; past MPI_Init
+    # the ranks talk over vader shm, so closing OOB does not break the running compute.
     r = subprocess.run([criu, "restore", "-D", img,
                         "--restore-detached", "--file-locks", "--shell-job",
-                        "--tcp-established", "--ext-unix-sk"],
+                        "--tcp-close", "--ext-unix-sk"],
                        capture_output=True, text=True)
     if r.returncode != 0:
         raise RuntimeError("criu restore rc=%d: %s" % (r.returncode, (r.stderr or r.stdout or "")[-600:]))
