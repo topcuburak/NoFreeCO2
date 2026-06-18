@@ -77,12 +77,17 @@ def _comm(pid):
         return None
 
 
-def hold_pid(pat, want_comm=None):
+def all_pids(pat, want_comm=None):
     out = subprocess.run(["pgrep", "-f", pat], capture_output=True, text=True).stdout.split()
     me = os.getpid()
-    pids = [int(p) for p in out if int(p) != me]      # never match the driver itself
-    if want_comm:                                     # require the binary's comm (e.g. "pr"):
+    pids = sorted(int(p) for p in out if int(p) != me)   # never match the driver itself
+    if want_comm:                                        # require comm (e.g. "pr"/"a7mp"/"a8mt"):
         pids = [p for p in pids if _comm(p) == want_comm]   # excludes python/sudo/criu ancestors
+    return pids
+
+
+def hold_pid(pat, want_comm=None):
+    pids = all_pids(pat, want_comm)          # tree ROOT = lowest pid (launched before its forks)
     return pids[0] if pids else None
 
 
@@ -96,17 +101,16 @@ def rss_of(pid):
     return None
 
 
+def tree_rss(pat, want_comm=None):
+    return sum(rss_of(p) or 0 for p in all_pids(pat, want_comm))   # sum the whole process tree
+
+
 def wait_resident(min_bytes, pat, timeout=120, want_comm=None):
     dl = time.monotonic() + timeout
     while time.monotonic() < dl:
-        pid = hold_pid(pat, want_comm)
-        if pid:
-            try:
-                for line in open(f"/proc/{pid}/status"):
-                    if line.startswith("VmRSS:") and int(line.split()[1]) * 1024 >= min_bytes:
-                        return pid
-            except OSError:
-                pass
+        pids = all_pids(pat, want_comm)
+        if pids and sum(rss_of(p) or 0 for p in pids) >= min_bytes:   # footprint may span children
+            return pids[0]
         time.sleep(1)
     return hold_pid(pat, want_comm)
 
@@ -131,6 +135,12 @@ def main() -> None:
                          "with --launch so we find/kill the right process.")
     ap.add_argument("--wait-timeout", type=int, default=120,
                     help="seconds to wait for the workload to reach footprint (bump for big graphs)")
+    ap.add_argument("--comm", default=None,
+                    help="override target comm (/proc/PID/comm) for pid matching. Use when the target "
+                         "sets its own name via prctl (A7 'a7mp', A8 'a8mt') so we never match the "
+                         "python driver / sudo (which share the script name in argv).")
+    ap.add_argument("--target-extra", default="",
+                    help="extra args appended to the python --target launch (e.g. '--procs 16')")
     args = ap.parse_args()
     if os.geteuid() != 0:
         raise SystemExit("[s2] run as root (sudo -E) -- criu needs CAP_SYS_ADMIN + RAPL")
@@ -138,9 +148,10 @@ def main() -> None:
     drive_w = 3.0 if "home" in args.store_out else 50.0
     target_py = os.path.join(_REPO, "scripts", args.target)
     pat = args.pat or args.target
-    # when launching a raw binary, require its comm (basename, 15-char kernel limit) so we never
-    # match the python driver / sudo / criu (which all carry the launch string in their argv).
-    want_comm = os.path.basename(shlex.split(args.launch)[0])[:15] if args.launch else None
+    # require the target's comm so we never match the python driver / sudo / criu (which all carry
+    # the launch/target string in their argv). Explicit --comm wins (A7/A8 set it via prctl);
+    # else derive from a --launch binary's basename (15-char kernel limit).
+    want_comm = args.comm or (os.path.basename(shlex.split(args.launch)[0])[:15] if args.launch else None)
     sizes = [float(s) for s in args.sizes.split(",") if s.strip()]
     print(f"[s2] criu={criu} target={args.target} drive_w={drive_w} store_out={args.store_out} sizes={sizes}")
 
@@ -168,7 +179,7 @@ def main() -> None:
             if args.launch:                                  # arbitrary binary (e.g. GAPBS) IS the target
                 cmd = args.launch
             else:
-                cmd = f"{sys.executable} {target_py} --gb {gb} --seconds 100000"
+                cmd = f"{sys.executable} {target_py} --gb {gb} --seconds 100000 {args.target_extra}"
             proc = subprocess.Popen(shlex.split(cmd), start_new_session=True,
                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             pid = wait_resident(gb * (1024 ** 3) * 0.9, pat, timeout=args.wait_timeout,
@@ -180,7 +191,7 @@ def main() -> None:
                 if pid is None:
                     print(f"[s2] {gb}GB: lost the process before cycle {c} -- stopping this size"); break
                 shutil.rmtree(img, ignore_errors=True); os.makedirs(img, exist_ok=True)
-                rss = rss_of(pid)                            # actual resident bytes at dump time
+                rss = tree_rss(pat, want_comm)               # whole-tree resident bytes at dump time
                 try:
                     rec_d = measure_operation(tele, workload="timed_dump", operation="criu_dump",
                         state_bytes=int(rss or gb * 1e9), baseline_seconds=args.baseline,
@@ -188,17 +199,19 @@ def main() -> None:
                     emit(rec_d, "dump", gb, c, dir_size(img), rss)
                 except Exception as e:
                     print(f"[s2] {gb}GB cyc{c} DUMP failed: {e}"); break
-                if pid:
-                    try: os.kill(pid, 9)
-                    except OSError: pass
+                if pid:                                       # kill the whole GROUP (multi-process tree):
+                    try: os.killpg(os.getpgid(pid), 9)        # leaving children alive would orphan them
+                    except OSError:                           # and collide pids on restore
+                        try: os.kill(pid, 9)
+                        except OSError: pass
                 try: proc.wait(timeout=2)                    # reap our child (cycle 0) so the PID frees
                 except Exception: pass
-                gone = False                                 # criu restore reclaims the ORIGINAL pid +
-                for _ in range(240):                         # every TID; a lingering zombie (slow 64-
-                    if pid is None or not os.path.exists(f"/proc/{pid}"):   # thread SIGKILL under load)
-                        gone = True; break                   # holds the pid -> 'fork: File exists'. Block
-                    try: proc.wait(timeout=0.5)              # until /proc/<pid> truly vanishes (group
-                    except Exception: pass                   # leader reaped => all its TIDs freed too).
+                gone = False                                  # criu restore reclaims the ORIGINAL pids +
+                for _ in range(240):                          # every TID; a lingering zombie (slow 64-
+                    if not all_pids(pat, want_comm):          # thread SIGKILL under load) holds a pid ->
+                        gone = True; break                    # 'fork: File exists'. Block until the WHOLE
+                    try: proc.wait(timeout=0.5)               # tree (parent + every forked child) is gone.
+                    except Exception: pass
                     time.sleep(0.5)
                 if not gone:
                     print(f"[s2] {gb}GB cyc{c}: pid {pid} would not exit -- skip restore"); break
