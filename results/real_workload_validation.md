@@ -104,5 +104,35 @@ off -> RSS tracks the target). 25->150 GB sweep, both tiers, 4 cycles, robust fl
   S2 and the GAPBS A5: the multi-thread mechanism cost is footprint-driven, tier-modulated, CPU-hold
   dominated. Tags `a8_duck_nvme` (6 pts), `a8_duck_sata` (4 pts).
 
+## A7 — DuckDB analytics (multi-PROCESS, latency-insensitive batch), criu
+`duck_mp.py` (16 independent DuckDB instances, separate address spaces, each ~gb/16 uncompressed
+table + batch GROUP BY). The process-tree counterpart to A8's thread pool: SAME engine, footprints,
+tiers -- the only variable is structure. 25->150 GB sweep, both tiers, 4 cycles, robust floor.
+
+**A7 (multi-process) vs A8 (multi-thread), NVMe:**
+| footprint | A7 dump | A8 dump | A7 restore | A8 restore |
+|---|---|---|---|---|
+| 100 GB | 75.4 s / 19.3 kJ | 51.3 s / 11.7 kJ | 13.0 s / 3.3 kJ | 20.4 s / 4.7 kJ |
+| 150 GB | 106.5 s / 28.1 kJ | 81.3 s / 19.7 kJ | 27.4 s / 7.1 kJ | 41.7 s / 10.2 kJ |
+| round-trip 150 GB | **134 s / 35.2 kJ** | **123 s / 29.9 kJ** | | |
+
+**Structural asymmetry (the MP-vs-MT result):**
+- Multi-process **dump is ~30% slower**: criu seizes/serializes 16 separate address spaces + writes
+  16 image sets -> more per-process overhead than one process with 64 threads.
+- Multi-process **restore is ~35% faster**: 16 independent processes fault their pages back in
+  parallel, vs one process restoring more serially.
+- Net round-trip: MP slightly costlier (dominated by the slower dump).
+- **SATA: the structure effect washes out** -- A7 ≈ A8 (e.g. 75 GB dump 239 s vs 195 s, both ~0.4 GB/s,
+  dump≈restore). The disk sets the time. So **process structure affects mechanism cost only in the
+  overhead-bound (fast-storage) regime; on slow storage the tier dominates and MP-vs-MT disappears.**
+- Both footprint-linear, muted ~6× criu tier flip. Tags `a7_duck_nvme` (6 pts), `a7_duck_sata` (4 pts).
+  (SATA A7 100 GB dump energy is a RAPL artifact -- 29.5 kJ vs the ~75 kJ trend; latency is clean.)
+
+**A7 was originally NPB-MPI (HPC batch) -- a reported boundary result:** criu DUMPS a live MPI job
+(measured: 1.79 GB / 1.61 s / 315 J on ford, after disabling launcher GPU/NVML VMAs and dumping with
+--tcp-established) but CANNOT transparently RESTORE it: the mpirun OOB listener port cannot be re-bound
+(TIME_WAIT), and --tcp-close does not help (it is a listening, not established, socket). This marks the
+boundary of transparent C/R -- restore must RE-ACQUIRE external/scarce resources (ports, PIDs, locks)
+that dump only READS -- alongside vLLM-TP and HACC. A7 thus pivoted to DuckDB-multi-process (criu-safe).
+
 ## A6 — gem5 (big-RSS single process), CPU/criu — PENDING
-## A7 — NPB-MPI (multi-PROCESS HPC batch), criu — PENDING (feasibility: criu over a live MPI job)
