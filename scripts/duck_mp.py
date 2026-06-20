@@ -24,7 +24,10 @@ def _setcomm(name: str) -> None:
         pass
 
 
-def hold(gb: float, threads: int, seconds: int) -> None:
+QUERY = "SELECT k % 1000 AS g, sum(a), avg(v), count(*) FROM t GROUP BY g"
+
+
+def build_con(gb: float, threads: int):
     import duckdb
     con = duckdb.connect()
     con.execute(f"PRAGMA threads={max(1, threads)}")
@@ -38,9 +41,24 @@ def hold(gb: float, threads: int, seconds: int) -> None:
                (random() * 1e18)::BIGINT AS b,
                random() AS v
         FROM range({rows}) tbl(i)""")
+    return con
+
+
+def hold(gb: float, threads: int, seconds: int) -> None:
+    con = build_con(gb, threads)
     stop = time.time() + seconds
     while time.time() < stop:
-        con.execute("SELECT k % 1000 AS g, sum(a), avg(v), count(*) FROM t GROUP BY g").fetchall()
+        con.execute(QUERY).fetchall()
+
+
+def job_worker(idx: int, gb: float, threads: int, queries: int, readydir: str, trig: str) -> None:
+    _setcomm("a7duck")
+    con = build_con(gb, threads)                                # setup
+    open(os.path.join(readydir, str(idx)), "w").close()        # signal this child is built
+    while trig and not os.path.exists(trig):                   # barrier: wait for the job trigger
+        time.sleep(0.05)
+    for _ in range(queries):                                   # the fixed job
+        con.execute(QUERY).fetchall()
 
 
 def main() -> None:
@@ -48,6 +66,8 @@ def main() -> None:
     ap.add_argument("--gb", type=float, default=64.0, help="TOTAL table footprint across procs (GB)")
     ap.add_argument("--procs", type=int, default=16)
     ap.add_argument("--seconds", type=int, default=100000)
+    ap.add_argument("--job-queries", type=int, default=0,
+                    help="dump-free baseline: each proc builds, barrier, runs N queries, exit")
     a = ap.parse_args()
     _setcomm("a7duck")
 
@@ -56,6 +76,27 @@ def main() -> None:
     threads = max(1, (os.cpu_count() or P) // P)                 # spread cores; process-dominated
     print(f"[a7-duck] PID={os.getpid()} {a.gb} GB over {P} DuckDB procs "
           f"({per:.2f} GB, {threads} thr each)", flush=True)
+
+    if a.job_queries > 0:                                        # dump-free baseline (parent coordinates)
+        import shutil
+        readydir = "/tmp/a7_ready"
+        shutil.rmtree(readydir, ignore_errors=True); os.makedirs(readydir)
+        trig = os.environ.get("RUNJOB_TRIGGER", "")
+        kids = []
+        for i in range(P):
+            pid = os.fork()
+            if pid == 0:
+                job_worker(i, per, threads, a.job_queries, readydir, trig)
+                os._exit(0)
+            kids.append(pid)
+        while len(os.listdir(readydir)) < P:                     # wait until all procs built (setup)
+            time.sleep(0.1)
+        print("RUNJOB_READY", flush=True)                       # job_energy now creates the trigger
+        for pid in kids:
+            os.waitpid(pid, 0)                                  # job runs until every proc exits
+        print(f"RUNJOB_DONE queries={a.job_queries} procs={P}", flush=True)
+        return
+
     for _ in range(P - 1):
         if os.fork() == 0:                                       # child: its own DuckDB instance
             _setcomm("a7duck")

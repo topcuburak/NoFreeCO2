@@ -30,6 +30,8 @@ def main() -> None:
     ap.add_argument("--seconds", type=int, default=100000)
     ap.add_argument("--report-every", type=float, default=10.0)
     ap.add_argument("--amp", action="store_true", help="bf16 autocast")
+    ap.add_argument("--job-steps", type=int, default=0,
+                    help="dump-free baseline: warmup, then run N training steps and exit (handshake)")
     args = ap.parse_args()
 
     import torch
@@ -58,6 +60,28 @@ def main() -> None:
     y = torch.randint(0, 1000, (args.batch,), device=dev)
 
     model.train()
+
+    def step():
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=args.amp):
+            loss = loss_fn(model(x), y)
+        loss.backward()
+        opt.step(); opt.zero_grad(set_to_none=True)
+        return loss
+
+    if args.job_steps > 0:                                  # dump-free baseline: fixed job, then exit
+        for _ in range(5):                                 # warmup (clocks, cudnn autotune, allocator)
+            step()
+        torch.cuda.synchronize(dev)
+        print("RUNJOB_READY", flush=True)
+        trig = os.environ.get("RUNJOB_TRIGGER")
+        while trig and not os.path.exists(trig):
+            time.sleep(0.05)
+        for _ in range(args.job_steps):
+            step()
+        torch.cuda.synchronize(dev)
+        print(f"RUNJOB_DONE steps={args.job_steps}", flush=True)
+        return
+
     it = 0
     t0 = time.time(); last = t0
     while time.time() - t0 < args.seconds:

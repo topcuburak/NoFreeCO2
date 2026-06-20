@@ -29,6 +29,8 @@ def main() -> None:
     ap.add_argument("--num-sparse", type=int, default=26, help="sparse feature lookups/sample")
     ap.add_argument("--seconds", type=int, default=100000)
     ap.add_argument("--report-every", type=float, default=10.0)
+    ap.add_argument("--job-steps", type=int, default=0,
+                    help="dump-free baseline: warmup, then run N training steps and exit (handshake)")
     args = ap.parse_args()
 
     import torch
@@ -54,6 +56,28 @@ def main() -> None:
     dense = torch.randn(args.batch, args.dense_dim, device=dev)
     idx = torch.randint(0, rows, (args.batch, args.num_sparse), device=dev)
     label = torch.randint(0, 2, (args.batch, 1), device=dev).float()
+
+    def step():
+        e = emb(idx).mean(dim=1)                            # sparse lookups -> [B, emb_dim]
+        out = top(torch.cat([e, bot(dense)], dim=1))
+        loss = loss_fn(out, label)
+        loss.backward()
+        opt.step(); opt.zero_grad(set_to_none=True)
+        return loss
+
+    if args.job_steps > 0:                                  # dump-free baseline: fixed job, then exit
+        for _ in range(5):
+            step()
+        torch.cuda.synchronize(dev)
+        print("RUNJOB_READY", flush=True)
+        trig = os.environ.get("RUNJOB_TRIGGER")
+        while trig and not os.path.exists(trig):
+            time.sleep(0.05)
+        for _ in range(args.job_steps):
+            step()
+        torch.cuda.synchronize(dev)
+        print(f"RUNJOB_DONE steps={args.job_steps}", flush=True)
+        return
 
     it = 0
     t0 = time.time(); last = t0
