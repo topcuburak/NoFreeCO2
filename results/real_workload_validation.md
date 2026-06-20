@@ -135,4 +135,30 @@ tiers -- the only variable is structure. 25->150 GB sweep, both tiers, 4 cycles,
 boundary of transparent C/R -- restore must RE-ACQUIRE external/scarce resources (ports, PIDs, locks)
 that dump only READS -- alongside vLLM-TP and HACC. A7 thus pivoted to DuckDB-multi-process (criu-safe).
 
-## A6 — gem5 (big-RSS single process), CPU/criu — PENDING
+## A6 — gem5 architecture simulator (big-RSS single process), CPU/criu
+gem5 v25.1 SE mode (AtomicSimpleCPU, non-KVM) running a static `bigmem` guest that faults in N GB;
+the guest's page touches grow the gem5 HOST process RSS to ~N GB (gem5 backs simulated DRAM with a
+host mmap). We criu the gem5 process. `--remote-gdb-port=0` to drop the GDB TCP listener. The
+real-multi-threaded-tool single-process criu case. 20/40/80 GB sweep, both tiers, 4 cycles.
+
+| footprint (gem5 RSS) | NVMe round-trip | SATA round-trip |
+|---|---|---|
+| ~22 GB | 16.9 s / 3.37 kJ | 104.5 s / 15.4 kJ |
+| ~44 GB | 35.9 s / 7.42 kJ | 194.8 s / 30.0 kJ |
+| ~86 GB | 66.7 s / 14.65 kJ | 383.6 s / 63.4 kJ |
+
+- gem5 host RSS = guest + growing overhead (SE page-non-reuse bloat): 20->21.8, 40->43.6, 80->85.8 GB.
+- **NVMe overhead-bound** (dump 1.7-2.0 GB/s, restore ~3.6 GB/s), **SATA bandwidth-bound** (0.39-0.45
+  GB/s, dump≈restore) -- same regime as A5/A7/A8. **Footprint-linear**, **muted flip ~5.8× lat / 4.3× E**.
+- Validates the criu model on a real, complex, multi-threaded architecture-simulator process. Tags
+  `a6_gem5_nvme`, `a6_gem5_sata`. NOTE: gem5 opens a remote-GDB TCP listener by default -- disable it
+  (`--remote-gdb-port=0`) or restore hits the same listener-rebind wall as NPB-MPI.
+
+## ==== TEMPORAL CAMPAIGN COMPLETE: A1-A8 + S1/S2, both tiers ====
+GPU regime (cuda-checkpoint, bandwidth-bound, NVMe->SATA flip 8-11×): A1 LLM-train, A2 LLM-serve,
+A3 ViT-train, A4 DLRM + S1. CPU regime (criu, overhead-bound on NVMe / bandwidth-bound on SATA,
+muted ~6× flip): A5 graph (mem-extreme 279 GB), A6 gem5, A7 DuckDB-multiprocess, A8 DuckDB-multithread
++ S2. Cross-cutting: mechanism cost is footprint-driven and storage-tier-modulated; the GPU/CPU
+regime split and the MP-vs-MT structural effect (overhead-bound regime only) are the key findings;
+transparent RESTORE bounds at MPI/TP runtime sockets (NPB-MPI, vLLM-TP, HACC) -- dump reads, restore
+must re-acquire scarce external resources.
