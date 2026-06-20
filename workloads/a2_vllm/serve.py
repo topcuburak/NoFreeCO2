@@ -264,6 +264,12 @@ def main() -> None:
     print(f"[a2] prefix_caching={pc}  repeat=x{args.repeat}  "
           f"unique={unique}  total_requests={len(inputs)}")
 
+    trig = os.environ.get("RUNJOB_TRIGGER")               # dump-free baseline handshake (job_energy):
+    if trig:                                              # engine + prompts ready = setup done; the
+        print("RUNJOB_READY", flush=True)                 # generate() below is the measured job
+        while not os.path.exists(trig):
+            time.sleep(0.05)
+
     print(f"[a2] generating ({len(inputs)} seqs, max_tokens={args.max_tokens}) ...")
     t0 = time.perf_counter()
     outputs = llm.generate(inputs, sampling)

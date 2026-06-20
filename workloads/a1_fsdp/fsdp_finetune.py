@@ -119,6 +119,9 @@ def main() -> None:
                     help="comma-separated optimizer steps to suspend at, e.g. 40,80,120,160,200 "
                          "(overrides --suspend-step). Each is a full destroy/dump/reinit/rebind cycle.")
     ap.add_argument("--log-every", type=int, default=10)
+    ap.add_argument("--job-steps", type=int, default=0,
+                    help="dump-free baseline: warmup, rank-0 RUNJOB_READY, all ranks wait on trigger, "
+                         "run N optimizer steps, exit (cross-rank handshake)")
     ap.add_argument("--resume-flag", default="/tmp/a1_resume")
     ap.add_argument("--destroyed-prefix", default="/tmp/a1_destroyed.",
                     help="per-rank held-marker prefix; the driver deletes <prefix><rank> to resume")
@@ -208,6 +211,36 @@ def main() -> None:
         log(0, f"will suspend/dump/resume at optimizer steps {suspend_set}")
 
     model.train()
+
+    if args.job_steps and args.job_steps > 0:            # dump-free baseline: fixed job, then exit
+        import itertools
+        batches = itertools.cycle(loader)
+        def opt_step():
+            for _ in range(args.grad_accum):
+                b = next(batches)
+                out = model(input_ids=b["input_ids"].to(dev, non_blocking=True),
+                            attention_mask=b["attention_mask"].to(dev, non_blocking=True),
+                            labels=b["labels"].to(dev, non_blocking=True))
+                (out.loss / args.grad_accum).backward()
+            model.clip_grad_norm_(1.0)
+            opt.step(); sched.step(); opt.zero_grad(set_to_none=True)
+        for _ in range(3):                                # warmup (clocks, cudnn, NCCL)
+            opt_step()
+        torch.cuda.synchronize(dev); dist.barrier()
+        if rank == 0:
+            print("RUNJOB_READY", flush=True)
+        trig = os.environ.get("RUNJOB_TRIGGER")
+        while trig and not os.path.exists(trig):          # all ranks wait for the job trigger
+            time.sleep(0.05)
+        dist.barrier()
+        for _ in range(args.job_steps):                   # the fixed job: N optimizer steps
+            opt_step()
+        torch.cuda.synchronize(dev); dist.barrier()
+        if rank == 0:
+            print(f"RUNJOB_DONE steps={args.job_steps}", flush=True)
+        dist.destroy_process_group()
+        return
+
     step = 0                                              # optimizer steps taken
     micro = 0
     accum_loss = 0.0
