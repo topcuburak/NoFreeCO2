@@ -48,6 +48,8 @@ def main() -> None:
     cmd = args.cmd[1:] if args.cmd and args.cmd[0] == "--" else args.cmd
     if not cmd:
         raise SystemExit("[job] no command given (put it after --)")
+    if cmd[0] in ("python", "python3"):                          # sudo strips PATH -> resolve the
+        cmd[0] = sys.executable                                  # conda interpreter explicitly
 
     gpus = [] if args.gpus == "none" else (None if args.gpus == "all"
             else [int(x) for x in args.gpus.split(",") if x.strip()])
