@@ -26,6 +26,8 @@ def main() -> None:
     ap.add_argument("--gb", type=float, default=64.0, help="approx in-memory table footprint (GB)")
     ap.add_argument("--threads", type=int, default=os.cpu_count())
     ap.add_argument("--seconds", type=int, default=100000)
+    ap.add_argument("--job-queries", type=int, default=0,
+                    help="dump-free baseline: after table build, run N queries then exit (handshake)")
     a = ap.parse_args()
     _setcomm("a8duck")
 
@@ -44,11 +46,22 @@ def main() -> None:
                (random() * 1e18)::BIGINT AS b,
                random() AS v
         FROM range({rows}) tbl(i)""")                       # random -> incompressible -> real bytes
-    print("[a8-duck] table built, looping aggregation query", flush=True)
+    QUERY = "SELECT k % 1000 AS g, sum(a), avg(v), count(*) FROM t GROUP BY g"
 
+    if a.job_queries > 0:                                  # dump-free baseline: fixed job, then exit
+        print("RUNJOB_READY", flush=True)                 # setup (table build) done
+        trig = os.environ.get("RUNJOB_TRIGGER")
+        while trig and not os.path.exists(trig):
+            time.sleep(0.05)
+        for _ in range(a.job_queries):
+            con.execute(QUERY).fetchall()
+        print(f"RUNJOB_DONE queries={a.job_queries}", flush=True)
+        return
+
+    print("[a8-duck] table built, looping aggregation query", flush=True)
     stop = time.time() + a.seconds
     while time.time() < stop:                               # multi-threaded scan+aggregate
-        con.execute("SELECT k % 1000 AS g, sum(a), avg(v), count(*) FROM t GROUP BY g").fetchall()
+        con.execute(QUERY).fetchall()
 
 
 if __name__ == "__main__":
