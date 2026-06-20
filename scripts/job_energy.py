@@ -100,6 +100,10 @@ def main() -> None:
     dram_j = dram_w * sec
     tot_j = gpu_j + cpu_j + dram_j
 
+    if sec > 180.0:                                             # RAPL pkg counter wraps ~every 224s
+        print(f"[job] WARNING: window {sec:.0f}s exceeds ~180s -- the RAPL counter can wrap more than "
+              f"once between starved samples under full load, UNDER-counting CPU energy. Prefer "
+              f"shorter jobs (<180s) and extrapolate. Treat this CPU number with suspicion.", flush=True)
     print(f"\n[job] {args.tag}: runtime {sec:.1f}s | energy GPU {gpu_j/1000:.2f} + CPU {cpu_j/1000:.2f} "
           f"+ DRAM {dram_j/1000:.2f} = {tot_j/1000:.2f} kJ  ({tot_j/sec:.0f} W avg)", flush=True)
     rec.extra.update(runtime_s=round(sec, 2), gpu_j=round(gpu_j, 1), cpu_j=round(cpu_j, 1),
