@@ -26,16 +26,19 @@ import glob
 import os
 import statistics as st
 
-# P in kW; E_mech in kJ (NVMe/SATA); C = compute hours (ASSUMED per workload -- adjust freely)
+# P in kW; E_mech in kJ (NVMe/SATA); C = compute hours.
+# C revised from a literature/MLPerf/vendor-benchmark search (durations + resource counts):
+# multi-hour jobs (A1 8B FT, A2 batch inference, A3 ViT training, A6 gem5 sim) ever suspend;
+# short jobs (A4 DLRM ~15min, A5 PageRank ~3min, A7/A8 DuckDB suite ~3min) fit one hour -> K=0.
 WORKLOADS = {
-    "A1": dict(name="FSDP Llama-8B train", C=4, P=1.471, nvme=36.0, sata=264.7),
-    "A2": dict(name="vLLM serving",        C=2, P=0.497, nvme=5.30, sata=35.7),
-    "A3": dict(name="ViT-Huge train",      C=4, P=0.526, nvme=4.79, sata=38.8),
-    "A4": dict(name="DLRM train",          C=3, P=0.312, nvme=4.70, sata=36.3),
-    "A5": dict(name="GAPBS graph",         C=2, P=0.255, nvme=12.4, sata=59.8),
-    "A6": dict(name="gem5 sim",            C=6, P=0.148, nvme=14.7, sata=63.4),
-    "A7": dict(name="DuckDB multi-proc",   C=3, P=0.311, nvme=22.6, sata=74.4),
-    "A8": dict(name="DuckDB multi-thread", C=3, P=0.302, nvme=16.4, sata=96.7),
+    "A1": dict(name="FSDP Llama-8B FT",    C=4,  P=1.471, nvme=36.0, sata=264.7),
+    "A2": dict(name="vLLM batch inference", C=2, P=0.497, nvme=5.30, sata=35.7),
+    "A3": dict(name="ViT-Huge train",      C=12, P=0.526, nvme=4.79, sata=38.8),
+    "A4": dict(name="DLRM train",          C=1,  P=0.312, nvme=4.70, sata=36.3),
+    "A5": dict(name="GAPBS graph",         C=1,  P=0.255, nvme=12.4, sata=59.8),
+    "A6": dict(name="gem5 sim",            C=8,  P=0.148, nvme=14.7, sata=63.4),
+    "A7": dict(name="DuckDB multi-proc",   C=1,  P=0.311, nvme=22.6, sata=74.4),
+    "A8": dict(name="DuckDB multi-thread", C=1,  P=0.302, nvme=16.4, sata=96.7),
 }
 HORIZONS = [4, 6, 8, 12, 16, 24, 36, 48]
 

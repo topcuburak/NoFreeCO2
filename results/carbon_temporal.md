@@ -7,36 +7,39 @@ measured (E_mech, T_mech). Monte-Carlo over start hours, per workload, per tier,
 
 - **CI data**: Electricity Maps hourly `direct` gCO2eq/kWh, ~50 countries, 2023 (`carbon_data/`).
 - **Workload inputs**: measured running power P + per-suspend E_mech (NVMe/SATA) from the campaign;
-  **compute time C is ASSUMED** (A1=4 A2=2 A3=4 A4=3 A5=2 A6=6 A7=3 A8=3 h) -- adjustable.
+  **compute time C is research-grounded** (A1=4 A2=2 A3=12 A4=1 A5=1 A6=8 A7=1 A8=1 h; see
+  `results/workload_durations_refs.md` for sources/resources). Short jobs (A4/A5/A7/A8) fit one hour.
 - net = naive - (cleanest-C-hours compute + K·E_mech·CI). gross = naive - compute (no mechanism).
 
 ## Headline (H=24, avg ~50 grids)
-| WL | power | gross savings | NVMe overhead (of savings) | SATA overhead | SATA net-positive |
-|---|---|---|---|---|---|
-| A1 FSDP | 1471 W | 18.9% | 0.4% | 3.1% | 87% |
-| A2 vLLM | 497 W | 20.4% | 0.2% | 1.1% | 88% |
-| A3 ViT | 526 W | 18.9% | 0.2% | 1.3% | 90% |
-| A4 DLRM | 312 W | 19.6% | 0.3% | 2.0% | 88% |
-| A5 graph | 255 W | 20.4% | 0.7% | 3.4% | 85% |
-| A7 DuckDB-MP | 311 W | 19.6% | 1.2% | 4.0% | 85% |
-| A8 DuckDB-MT | 302 W | 19.6% | 0.9% | 5.4% | 83% |
-| A6 gem5 | 148 W | 17.5% | 1.7% | 7.4% | 83% |
+| WL | C | power | gross savings | NVMe overhead | SATA overhead | K |
+|---|---|---|---|---|---|---|
+| A4 DLRM | 1 h | 312 W | 21.3% | 0% | 0% | 0.00 |
+| A5 graph | 1 h | 255 W | 21.3% | 0% | 0% | 0.00 |
+| A7 DuckDB-MP | 1 h | 311 W | 21.3% | 0% | 0% | 0.00 |
+| A8 DuckDB-MT | 1 h | 302 W | 21.3% | 0% | 0% | 0.00 |
+| A2 vLLM batch | 2 h | 497 W | 20.4% | 0.2% | 1.1% | 0.27 |
+| A1 FSDP FT | 4 h | 1471 W | 18.9% | 0.4% | 3.1% | 0.56 |
+| A6 gem5 sim | 8 h | 148 W | 15.8% | 1.7% | **8.0%** | 0.96 |
+| A3 ViT train | 12 h | 526 W | 11.9% | 0.5% | 1.9% | 1.34 |
+(overhead = fraction of gross savings lost to suspend/restore.)
 
 ## Findings
-1. **Temporal shifting saves ~17-25% carbon** (H=24->48, avg; up to ~33-36% in volatile grids like
-   DE/CA), growing monotonically with deadline slack (H-C). Savings %% track *relative* CI swing, so a
-   flat-but-low grid (France) can show high %% at low absolute gCO2; high-CI grids save more grams.
-2. **Mechanism overhead is small but tier- and power-dependent.** NVMe < 2% of the gross savings
-   (negligible); SATA 1-7%. It scales **inversely with workload power**: the fixed E_mech is a larger
-   slice of a low-power job's energy, so A6 gem5 (148 W) loses 7.4% of its savings to SATA suspends vs
-   A1 FSDP (1471 W) at 3.1%.
-3. **K stays low (0.3-0.8 suspends/instance).** Grid CI is temporally autocorrelated (diurnal solar/
-   wind), so the cleanest hours cluster and the optimal schedule rarely fragments -- the feared
-   "many suspends" does not materialize for deadline-budget shifting at hourly granularity.
-4. **When suspending is NOT worth it (mechanism cost flips the decision):** at short horizons / flat
-   grids the overhead exceeds the saving. Fraction of instances NET-NEGATIVE on SATA: H=6 ~47-100%,
-   H=12 ~29-37%, H=24 ~13-17%, H=48 ~10-14%. The danger corner is **low slack + slow tier + low-power
-   workload + flat grid**.
+1. **Job duration decides everything.** Short jobs (A4/A5/A7/A8, C=1 h) fit inside one hour, so they
+   shift to the single cleanest hour with **K=0 suspends and ZERO mechanism overhead** -- and get the
+   highest gross savings (~21%, they can pick the very best hour). Only **multi-hour jobs (A1, A2, A3,
+   A6) ever suspend** and pay overhead. So the suspend/restore overhead is a *long-job* phenomenon.
+2. **Temporal shifting saves ~12-25% carbon** at H=24 (more with horizon; up to ~33% in volatile grids
+   like DE/CA). Longer jobs save *less* (they must occupy more hours incl. less-clean ones: A3 C=12
+   fills half of H=24 -> only 11.9%).
+3. **Mechanism overhead is small, tier- and power-dependent, and worst for low-power long jobs on
+   SATA.** NVMe < 2% of savings (negligible) everywhere. SATA: A2 1.1%, A1 3.1%, A6 gem5 **8.0%** --
+   the fixed E_mech is a bigger slice of gem5's tiny 148 W draw over a long 8 h job.
+4. **K stays low (0.3-1.3).** Grid CI is temporally autocorrelated (diurnal), so cleanest hours
+   cluster and the optimal schedule rarely fragments; the feared "many suspends" doesn't materialize.
+5. **When suspending is NOT worth it:** at short horizons / flat grids the overhead exceeds the saving
+   for the long-job workloads (10-17% of instances net-negative at H=24, more at H<=8). The danger
+   corner is **long job + low power + slow tier + low slack + flat grid** (A6 gem5 is the poster child).
 
 ## Takeaway for the paper
 Mechanism cost is the **decision-flipping factor in the low-slack / SATA / low-power corner**, while
