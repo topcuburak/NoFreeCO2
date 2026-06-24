@@ -58,7 +58,11 @@ def main() -> None:
     except OSError:
         pass
 
-    env = dict(os.environ, RUNJOB_TRIGGER=TRIGGER)
+    env = dict(os.environ)
+    if not args.no_handshake:                                   # in no-handshake mode we never create
+        env["RUNJOB_TRIGGER"] = TRIGGER                         # the trigger -> don't make handshake-
+    else:                                                       # aware scripts (serve.py) wait for it
+        env.pop("RUNJOB_TRIGGER", None)
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             text=True, bufsize=1, env=env)
 
