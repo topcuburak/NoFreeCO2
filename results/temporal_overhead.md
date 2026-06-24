@@ -57,6 +57,30 @@ it from negligible to noticeable. The **lowest-power workloads pay the highest p
 denominator): gem5 (148 W) at 2.8%/11.9% vs FSDP (1471 W) at 0.7%/5.0%. Scale: 30 min -> 2x these %,
 2 h -> 0.5x. Using saturated active power makes these % a LOWER bound (real idle -> larger fraction).
 
+## Per-suspend cost card (energy + LATENCY, both tiers) -- inputs for the carbon model
+Round-trip dump+restore, robust floor. Both E_mech and T_mech are saved per leg in the timed_dump
+records (t_start_mono/t_end_mono + full_total_j).
+| WL | footprint | NVMe E / T | SATA E / T | run power |
+|---|---|---|---|---|
+| A1 | 148 GB | 36.0 kJ / 71.7 s | 264.7 kJ / 630.6 s | 1471 W |
+| A2 | 41 GB | 5.30 kJ / 20.2 s | 35.7 kJ / 173.0 s | 497 W |
+| A3 | 35 GB | 4.79 kJ / 18.5 s | 38.8 kJ / 157.3 s | 526 W |
+| A4 | 33 GB | 4.70 kJ / 18.0 s | 36.3 kJ / 146.9 s | 312 W |
+| A5 | 71 GB | 12.4 kJ / 55.5 s | 59.8 kJ / 311.7 s | 255 W |
+| A6 | 50 GB | 14.7 kJ / 66.7 s | 63.4 kJ / 383.6 s | 148 W |
+| A7 | 100 GB | 22.6 kJ / 88.4 s | 74.4 kJ / 573.1 s | 311 W |
+| A8 | 100 GB | 16.4 kJ / 72.0 s | 96.7 kJ / 495.6 s | 302 W |
+
+## Multi-suspend carbon model (the K dependence)
+A job interrupted K times pays K independent (E_mech, T_mech) pairs:
+- carbon overhead   = K · E_mech · CI            (gCO2 from the dump/restore work)
+- added latency     = K · T_mech                 (completion-time stretch)
+- carbon saved      = E_shifted · (CI_dirty - CI_clean)
+- NET = saved - overhead;  break-even is in K.
+More suspends -> finer carbon tracking (more saved) but more mechanism overhead. On SATA the
+per-suspend cost is ~8x NVMe, so the optimal K -- and whether suspending pays at all -- flips with
+the storage tier. (C2 analysis quantifies this against real CI traces.)
+
 ## Idle floor (resident-but-not-computing) and duty cycle
 Measured with `steady_power.py` / `job_energy.py --no-handshake`:
 - **Bare GPU idle** (one A100 holding 20 GB, no compute): **73 W board** + 125 W CPU node baseline.
