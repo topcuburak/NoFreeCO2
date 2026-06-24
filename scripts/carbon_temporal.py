@@ -8,7 +8,7 @@ hours in [t, t+H] and suspends the rest; each run<->suspend transition is a dump
   naive_gco2  = sum(CI[t : t+C]) * P_kw                         # run now, C contiguous hours
   compute     = sum(C cleanest CI in window) * P_kw            # shifted compute
   K           = (# run-blocks) - 1                              # internal suspend gaps
-  mech_gco2   = sum over gaps of E_mech_kWh * mean(CI_dump, CI_restore)
+  mech_gco2   = sum over gaps of dump_kWh*CI_suspend_hr + restore_kWh*CI_resume_hr  # split pricing
   aware_gco2  = compute + mech_gco2
   net savings = naive - aware ;  gross = naive - compute ;  overhead = mech / gross
 
@@ -26,19 +26,19 @@ import glob
 import os
 import statistics as st
 
-# P in kW; E_mech in kJ (NVMe/SATA); C = compute hours.
-# C revised from a literature/MLPerf/vendor-benchmark search (durations + resource counts):
-# multi-hour jobs (A1 8B FT, A2 batch inference, A3 ViT training, A6 gem5 sim) ever suspend;
-# short jobs (A4 DLRM ~15min, A5 PageRank ~3min, A7/A8 DuckDB suite ~3min) fit one hour -> K=0.
+# P in kW; C = compute hours; energy split into DUMP half (suspend+store) and RESTORE half
+# (load+resume) per tier, in kJ -- so the dump is priced at the suspend-hour CI and the restore at
+# the resume-hour CI (not their average). Measured from the campaign (A2-A8 raw; A1 NVMe from its
+# doc, A1 SATA estimated from the GPU-SATA dump/restore ratio). dump_X / rest_X.
 WORKLOADS = {
-    "A1": dict(name="FSDP Llama-8B FT",    C=4,  P=1.471, nvme=36.0, sata=264.7),
-    "A2": dict(name="vLLM batch inference", C=2, P=0.497, nvme=5.30, sata=35.7),
-    "A3": dict(name="ViT-Huge train",      C=12, P=0.526, nvme=4.79, sata=38.8),
-    "A4": dict(name="DLRM train",          C=1,  P=0.312, nvme=4.70, sata=36.3),
-    "A5": dict(name="GAPBS graph",         C=1,  P=0.255, nvme=12.4, sata=59.8),
-    "A6": dict(name="gem5 sim",            C=8,  P=0.148, nvme=14.7, sata=63.4),
-    "A7": dict(name="DuckDB multi-proc",   C=1,  P=0.311, nvme=22.6, sata=74.4),
-    "A8": dict(name="DuckDB multi-thread", C=1,  P=0.302, nvme=16.4, sata=96.7),
+    "A1": dict(name="FSDP Llama-8B FT",     C=4,  P=1.471, dump_nvme=25.66, rest_nvme=10.35, dump_sata=143.0, rest_sata=121.7),
+    "A2": dict(name="vLLM batch inference", C=2,  P=0.497, dump_nvme=3.70,  rest_nvme=1.60,  dump_sata=19.18, rest_sata=16.50),
+    "A3": dict(name="ViT-Huge train",       C=12, P=0.526, dump_nvme=3.39,  rest_nvme=1.39,  dump_sata=20.83, rest_sata=17.92),
+    "A4": dict(name="DLRM train",           C=1,  P=0.312, dump_nvme=3.31,  rest_nvme=1.35,  dump_sata=19.40, rest_sata=16.87),
+    "A5": dict(name="GAPBS graph",          C=1,  P=0.255, dump_nvme=8.53,  rest_nvme=3.91,  dump_sata=35.21, rest_sata=24.60),
+    "A6": dict(name="gem5 sim",             C=8,  P=0.148, dump_nvme=9.40,  rest_nvme=5.25,  dump_sata=32.76, rest_sata=30.61),
+    "A7": dict(name="DuckDB multi-proc",    C=1,  P=0.311, dump_nvme=28.14, rest_nvme=7.06,  dump_sata=29.51, rest_sata=44.90),
+    "A8": dict(name="DuckDB multi-thread",  C=1,  P=0.302, dump_nvme=19.72, rest_nvme=10.17, dump_sata=55.19, rest_sata=41.50),
 }
 HORIZONS = [4, 6, 8, 12, 16, 24, 36, 48]
 
@@ -70,7 +70,7 @@ def run_blocks(sorted_idx):
     return blocks
 
 
-def eval_instance(ci, t, H, C, P, emech_kwh):
+def eval_instance(ci, t, H, C, P, dump_kwh, rest_kwh):
     win = ci[t:t + H]
     if any(v is None for v in win):
         return None
@@ -82,9 +82,9 @@ def eval_instance(ci, t, H, C, P, emech_kwh):
     K = len(blocks) - 1
     mech = 0.0
     for b in range(K):                                  # gap between block b and b+1
-        ci_dump = win[blocks[b][1]]                     # end of block b (suspend here)
-        ci_rest = win[blocks[b + 1][0]]                 # start of next block (restore here)
-        mech += emech_kwh * 0.5 * (ci_dump + ci_rest)
+        ci_dump = win[blocks[b][1]]                     # CI_first: suspend+store (DUMP) happen here
+        ci_rest = win[blocks[b + 1][0]]                 # CI_second: load+resume (RESTORE) happen here
+        mech += dump_kwh * ci_dump + rest_kwh * ci_rest
     aware = compute + mech
     gross = naive - compute
     return dict(naive=naive, compute=compute, mech=mech, aware=aware,
@@ -120,7 +120,8 @@ def main() -> None:
     rows = []
     for wl, w in WORKLOADS.items():
         for tier in ("nvme", "sata"):
-            emech_kwh = w[tier] / 3600.0                # kJ -> kWh
+            dump_kwh = w[f"dump_{tier}"] / 3600.0       # kJ -> kWh, dump half (suspend+store)
+            rest_kwh = w[f"rest_{tier}"] / 3600.0       # restore half (load+resume)
             for H in HORIZONS:
                 if H < w["C"]:
                     continue
@@ -128,7 +129,7 @@ def main() -> None:
                 net_pct, gross_pct, ovh_pct, Ks, pos = [], [], [], [], []
                 for c, ci in traces.items():
                     for t in range(0, len(ci) - H, args.step):
-                        r = eval_instance(ci, t, H, w["C"], w["P"], emech_kwh)
+                        r = eval_instance(ci, t, H, w["C"], w["P"], dump_kwh, rest_kwh)
                         if r is None or r["naive"] <= 0:
                             continue
                         net_pct.append(100 * r["net"] / r["naive"])

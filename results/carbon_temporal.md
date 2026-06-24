@@ -9,7 +9,11 @@ measured (E_mech, T_mech). Monte-Carlo over start hours, per workload, per tier,
 - **Workload inputs**: measured running power P + per-suspend E_mech (NVMe/SATA) from the campaign;
   **compute time C is research-grounded** (A1=4 A2=2 A3=12 A4=1 A5=1 A6=8 A7=1 A8=1 h; see
   `results/workload_durations_refs.md` for sources/resources). Short jobs (A4/A5/A7/A8) fit one hour.
-- net = naive - (cleanest-C-hours compute + K·E_mech·CI). gross = naive - compute (no mechanism).
+- net = naive - (cleanest-C-hours compute + mech). gross = naive - compute (no mechanism).
+- **Split mechanism pricing**: per gap, dump half (suspend+store) is charged at the suspend-hour CI,
+  restore half (load+resume) at the resume-hour CI (not their average). Dump/restore energies measured
+  per workload/tier (A7 notably restore>dump on SATA). Result ~unchanged vs averaging (gap is short ->
+  CI_suspend ~ CI_resume), but more precise.
 
 ## Headline (H=24, avg ~50 grids)
 | WL | C | power | gross savings | NVMe overhead | SATA overhead | K |
