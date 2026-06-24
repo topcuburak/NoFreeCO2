@@ -33,6 +33,13 @@ prices mechanism overhead) on ACTUAL CI. Compared head-to-head with the ORACLE (
    smaller than the oracle case. The decision-flipping corner (low-power/SATA/long-job) persists but
    is governed by lost savings, not extra suspends.
 
-## TODO
-- Add the measured PREDICTION COST (CarbonCast inference energy+latency, per decision) to the
-  forecast-aware total -- pending the inference-energy measurement on ford.
+4. **Prediction cost MEASURED (the literature gap), and negligible.** CarbonCast Tier-2 inference on
+   ford (CPU, our job_energy harness): **27.85 ms / 4.07 J per predict**; one 96h forecast (4 predicts)
+   = **111 ms / 16.3 J / ~1.36 mgCO2** (CI 300), 145 W while predicting. Per decision that is
+   **~0.0004% of a job's energy** (A6 ~4.3 MJ) and **~0.004% of the carbon saved** -- moves net savings
+   by ~0.1 pp (capture 78.8% -> 78.7%). Fleet-scale (1000 regions x hourly) ~ **0.1 kWh/day**. First
+   MEASURED forecaster-footprint number; charged as PRED_KWH=4.53e-6 per decision.
+
+## Status: COMPLETE
+Real predictor in the loop: decide on forecast, pay on actual, + measured mechanism AND prediction
+cost. -> results/carbon_forecast.csv ; cc_infer record in data/job_energy.jsonl on ford.

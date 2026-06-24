@@ -40,8 +40,13 @@ def load_blocks(path, blk=96):
     return blocks
 
 
-def eval_one(sel_ci, act_ci, C, P, dump_kwh, rest_kwh):
-    """Pick C cleanest by sel_ci; emit + price mechanism on act_ci."""
+# CarbonCast measured per-96h-forecast inference energy = 16.3 J = 4.527e-6 kWh (CPU, ford, 2155
+# predicts/60s -> 4.07 J/predict x4). Charged once per scheduling decision for the forecast path only.
+PRED_KWH = 16.3 / 3.6e6
+
+
+def eval_one(sel_ci, act_ci, C, P, dump_kwh, rest_kwh, pred_kwh=0.0):
+    """Pick C cleanest by sel_ci; emit + price mechanism on act_ci. pred_kwh = forecaster cost."""
     H = len(act_ci)
     naive = sum(act_ci[:C]) * P
     sel = sorted(sorted(range(H), key=lambda i: sel_ci[i])[:C])
@@ -51,7 +56,8 @@ def eval_one(sel_ci, act_ci, C, P, dump_kwh, rest_kwh):
     mech = 0.0
     for b in range(K):
         mech += dump_kwh * act_ci[blocks[b][1]] + rest_kwh * act_ci[blocks[b + 1][0]]
-    return naive, naive - (compute + mech), naive - compute, K   # naive, net, gross, K
+    pred = pred_kwh * act_ci[0]                                   # one forecast at decision time
+    return naive, naive - (compute + mech + pred), naive - compute, K   # naive, net, gross, K
 
 
 def main() -> None:
@@ -84,7 +90,8 @@ def main() -> None:
                             continue
                         sp, sa = prd[:H], act[:H]
                         nv, on, og, oK = eval_one(sa, sa, w["C"], w["P"], dump_kwh, rest_kwh)   # ORACLE
-                        _,  fn, fg, fK = eval_one(sp, sa, w["C"], w["P"], dump_kwh, rest_kwh)   # FORECAST
+                        _,  fn, fg, fK = eval_one(sp, sa, w["C"], w["P"], dump_kwh, rest_kwh,
+                                                  pred_kwh=PRED_KWH)                            # FORECAST + pred cost
                         if nv <= 0:
                             continue
                         onet.append(100 * on / nv); fnet.append(100 * fn / nv)
