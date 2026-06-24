@@ -52,8 +52,16 @@ it depends on (deadline slack, storage tier, workload power, grid volatility), w
 (E_mech, P) make quantifiable. Output: `results/carbon_temporal_2023.csv` (126 rows: wl x tier x H).
 
 ## Caveats / next
-- Compute times C are assumed; the curves shift with C (bigger C -> needs bigger H for slack).
-- Hourly granularity + greedy-cleanest (carbon-optimal, mechanism-agnostic) -> a mechanism-aware
-  scheduler would trade a little carbon for fewer suspends, lowering K further.
-- Initial deferral (t -> first clean hour) modeled as a free delayed start (idle-wait), not a suspend.
-- 2023 only; multi-year and the absolute-gCO2 view are easy extensions.
+- **ORACLE / perfect foresight (the big one).** We pick the C cleanest hours knowing all H future CI
+  values -> results are an **upper bound on savings** and a **lower bound on K (and mechanism overhead)**.
+  A real scheduler uses a *forecast*; forecast error -> saves LESS and (if reactive/threshold) suspends
+  MORE. So in practice the mechanism cost eats a BIGGER fraction of a SMALLER benefit, and the
+  "not-worth-it" corner (low-power/SATA/low-slack) widens. Our numbers are the optimistic bound.
+  TODO: add threshold/forecast policies to quantify the price of imperfect foresight.
+- **Idle power during suspend NOT charged.** Model assumes **suspend-and-free** (resource released/
+  powered-down/repurposed). Under **suspend-and-reserve** (resource held idle while waiting), add
+  P_idle*CI per suspended hour (measured: 73 W/A100, 209 W resident vLLM, 125 W CPU node) -- this can
+  DOMINATE and flip the benefit negative. The carbon win requires actually freeing the resource.
+- Compute times C are assumed (research-grounded, see workload_durations_refs.md).
+- Hourly granularity + greedy-cleanest (carbon-optimal, mechanism-agnostic). Initial deferral modeled
+  as a free delayed start, not a suspend. 2023 only; multi-year + absolute-gCO2 are easy extensions.
