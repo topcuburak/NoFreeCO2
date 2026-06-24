@@ -57,6 +57,22 @@ it from negligible to noticeable. The **lowest-power workloads pay the highest p
 denominator): gem5 (148 W) at 2.8%/11.9% vs FSDP (1471 W) at 0.7%/5.0%. Scale: 30 min -> 2x these %,
 2 h -> 0.5x. Using saturated active power makes these % a LOWER bound (real idle -> larger fraction).
 
-## TODO
-- Firm up A2 mechanism energy (full GPU+CPU+DRAM+drive, currently cpu-only-derived).
-- Idle-floor power (resident-but-not-computing) -> duty-cycle-adjusted running energy for serving.
+## Idle floor (resident-but-not-computing) and duty cycle
+Measured with `steady_power.py` / `job_energy.py --no-handshake`:
+- **Bare GPU idle** (one A100 holding 20 GB, no compute): **73 W board** + 125 W CPU node baseline.
+  A parked GPU is NOT free -- ~19% of its active power. CPU node idle ~125 W (static floor).
+- **vLLM engine idle** (model + KV pool resident, scheduler threads, zero requests): **209 W**
+  (GPU 78 + CPU 131). Tag `a2_idle`.
+
+**A2 serving is bursty**, so its running power is a range, not the saturated 497 W:
+`E_serve(util) = 497·util + 209·(1-util) = 209 + 288·util`.
+| util | A2 power | NVMe %1h (5.30 kJ) | SATA %1h (35.68 kJ) |
+|---|---|---|---|
+| 1.0 saturated | 497 W | 0.30% | 2.0% |
+| 0.5 | 353 W | 0.42% | 2.8% |
+| 0.3 typical online | 295 W | 0.50% | 3.4% |
+
+The idle floor also frames the SCHEDULING decision: suspending frees the resource (can power down /
+repurpose, saving the idle floor), whereas leaving a workload parked still burns it (73 W/GPU, 209 W
+for a resident vLLM engine). The other 7 workloads run continuously busy (no idle phase), so their
+active power = running average; only serving needs the duty-cycle treatment.
