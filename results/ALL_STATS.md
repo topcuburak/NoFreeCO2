@@ -80,6 +80,19 @@ A1=4 A2=2 A3=12 A4=1 A5=1 A6=8 A7=1 A8=1.
 - Short jobs (C=1 h): K=0, zero overhead. Overhead is a long-job phenomenon, worst for A6 gem5.
 - 10-17% of long-job instances net-negative at H=24 (more at H<=8): suspend not worth it in the
   low-slack / SATA / low-power / flat-grid corner.
+- Caveats: ORACLE (perfect foresight) = upper bound; idle power during suspend NOT charged
+  (suspend-and-free assumption; suspend-and-reserve would add P_idle*CI and can flip negative).
+
+## 6b. Carbon temporal with a REAL predictor (CarbonCast, decide-on-forecast/pay-on-actual)
+CarbonCast (pretrained CNN-LSTM, run locally on ford, CPU), 13 regions Jul-Dec 2021. MAPE tracks
+volatility (FPL 3.4% .. ES 19%). Forecast scheduler picks cleanest by PREDICTED CI, pays on ACTUAL.
+- **Captures ~79-87% of oracle savings** (loses 1.3-3.2 pp) = **~3% more total carbon** -> matches
+  EuroSys'24 (14% MAPE -> ~3%). e.g. H=24: A1 oracle 13.5% -> forecast 11.2%; short jobs 15.0 -> 11.8.
+- **Forecasting SUSPENDS LESS (K drops):** A1 0.43->0.14, A3 1.24->0.77 -- the predictor SMOOTHS CI so
+  clean hours cluster -> fewer suspends -> LOWER mechanism overhead (opposite of reactive threshold).
+- **Prediction cost MEASURED (literature gap):** 4.07 J/predict, **16.3 J / 96h forecast** (145 W CPU,
+  27.85 ms/predict). Per decision ~0.0004% of job energy / ~0.004% of carbon saved (moves capture
+  78.8->78.7%). Fleet-scale (1000 regions x hourly) ~0.1 kWh/day. First measured forecaster footprint.
 
 ## 7. Workload durations + resource counts (see workload_durations_refs.md)
 A1 8B FT ~1-4 h/8 GPU; A2 batch ~1.5 h/1 GPU; A3 ViT-H days (2500 TPUv3-core-days); A4 DLRM ~15 min/
@@ -89,3 +102,17 @@ A1 8B FT ~1-4 h/8 GPU; A2 batch ~1.5 h/1 GPU; A3 ViT-H days (2500 TPUv3-core-day
 Migrate leg = image_GB x per-byte + RTT; energy 3.6 kJ/GB fabric (band 0.3-6) + endpoint hold.
 WAN single-stream 8-25 s/GB (RTT-scaled), parallel ~0.5-1 s/GB. (network_coefficients_lit.md.)
 3-leg spatial = dump (measured) + migrate (modeled) + restore (measured) -- PENDING analysis.
+
+## Doc index (results/ in the repo)
+- `ALL_STATS.md` -- this master inventory.
+- Mechanism cost: `real_workload_validation.md` (A3-A8), `a1_fsdp_checkpoint.md`, `vllm_dump_cycle_tp1.md`,
+  `a2_tp4_kv_suspend.md`, `s1_multigpu_suspend.md`, `s2_criu_dram.md`, components (`temporal_components.md`,
+  `bw_energy_decomposition.md`, `hbm_host_characterization.md`, `storage_*`, `multi_gpu_pcie_contention.md`).
+- Overhead/baselines: `temporal_overhead.md` (running power, idle floor, per-suspend cost card, multi-
+  suspend model), `workload_durations_refs.md` (C values + resources, sourced).
+- Carbon: `carbon_temporal.md` (oracle, ~50 grids), `carbon_forecast.md` (CarbonCast real predictor),
+  `ci_forecasting_refs.md` (forecasters survey + sources).
+- Spatial (pending): `network_coefficients_lit.md`, `wan_migration_overhead.md`.
+- Scripts: `scripts/sweep_criu_dump.py`, `timed_dump_experiment.py`, `job_energy.py`, `carbon_temporal.py`,
+  `carbon_temporal_forecast.py`, `cc_infer_bench.py`. Raw data: ford `data/*.jsonl` + local results_master/.
+- REMAINING: spatial migrate-leg analysis; optional idle-aware + threshold-policy carbon variants.
