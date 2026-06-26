@@ -42,8 +42,31 @@ measured (E_mech, T_mech). Monte-Carlo over start hours, per workload, per tier,
 4. **K stays low (0.3-1.3).** Grid CI is temporally autocorrelated (diurnal), so cleanest hours
    cluster and the optimal schedule rarely fragments; the feared "many suspends" doesn't materialize.
 5. **When suspending is NOT worth it:** at short horizons / flat grids the overhead exceeds the saving
-   for the long-job workloads (10-17% of instances net-negative at H=24, more at H<=8). The danger
-   corner is **long job + low power + slow tier + low slack + flat grid** (A6 gem5 is the poster child).
+   for the long-job workloads. The danger corner is **long job + low power + slow tier + low slack +
+   flat grid** (A6 gem5 is the poster child).
+
+## Kill zone -- where suspend/restore overhead EXCEEDS the carbon saved (net<0)
+`scripts/carbon_killzone.py`. %% of (grid x start-hour) instances with net<0 (suspending LOSES):
+| WL | C | P | tier | H4 | H6 | H8 | H12 | H16 | H24 | H48 | flat-grid worst |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| A4/A5/A7/A8 | 1h | 255-312W | both | 0 | 0 | 0 | 0 | 0 | 0 | 0 | **0%** |
+| A2 vLLM | 2h | 497W | nvme | 2 | 2 | 1 | 1 | 0 | 0 | 0 | 5% |
+| A2 vLLM | 2h | 497W | sata | 9 | 8 | 6 | 4 | 3 | 2 | 1 | 11% |
+| A1 FSDP | 4h | 1471W | nvme | - | 4 | 3 | 2 | 1 | 1 | 0 | 7% |
+| A1 FSDP | 4h | 1471W | sata | - | **17** | 14 | 11 | 7 | 5 | 4 | 19% |
+| A6 gem5 | 8h | 148W | nvme | - | - | - | 8 | 5 | 2 | 1 | 13% |
+| A6 gem5 | 8h | 148W | sata | - | - | - | **21** | 15 | 9 | 7 | **24%** |
+| A3 ViT | 12h | 526W | nvme | - | - | - | - | 2 | 1 | 0 | 5% |
+| A3 ViT | 12h | 526W | sata | - | - | - | - | 7 | 3 | 1 | 15% |
+
+- **Short jobs (C=1) are IMMUNE: 0% everywhere** -- they fit one hour, K=0, never suspend, so the
+  mechanism can never exceed the saving (they save or break even, never lose).
+- **Only multi-hour jobs get killed**, scaling with four conditions that must align: SATA (NVMe peaks
+  8%, SATA 24%), tight deadline (worst at smallest H, rescued by slack), low power (A6 gem5 148W worst),
+  flat grid (2-5x the all-grid rate). **Worst corner: A6-class low-power long job on SATA, tight
+  deadline, flat grid -> net-negative ~1 in 4 times.** Negligible (<2%) in the easy corner (NVMe +
+  short job + loose deadline + volatile grid). NB: suspend-and-free accounting; charging idle power
+  during suspend would push net-negative almost everywhere (a separate, larger effect).
 
 ## Takeaway for the paper
 Mechanism cost is the **decision-flipping factor in the low-slack / SATA / low-power corner**, while
