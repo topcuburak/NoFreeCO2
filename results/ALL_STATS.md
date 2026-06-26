@@ -110,9 +110,12 @@ WAN single-stream 8-25 s/GB (RTT-scaled), parallel ~0.5-1 s/GB. (network_coeffic
   `bw_energy_decomposition.md`, `hbm_host_characterization.md`, `storage_*`, `multi_gpu_pcie_contention.md`).
 - Overhead/baselines: `temporal_overhead.md` (running power, idle floor, per-suspend cost card, multi-
   suspend model), `workload_durations_refs.md` (C values + resources, sourced).
-- Carbon: `carbon_temporal.md` (oracle, ~50 grids), `carbon_forecast.md` (CarbonCast real predictor),
-  `ci_forecasting_refs.md` (forecasters survey + sources).
+- Carbon: `carbon_temporal.md` (oracle, ~50 grids, hourly + kill zone), `carbon_temporal_15min.md`
+  (SUB-HOURLY 15-min: no-suspend free-shift vs with-suspend, 18 regions x 80 starts -- short jobs lose
+  immunity, SATA kills ~1/3 of short jobs and ~45% of A6), `carbon_forecast.md` (CarbonCast real
+  predictor), `ci_forecasting_refs.md` (forecasters survey + sources).
 - Spatial (pending): `network_coefficients_lit.md`, `wan_migration_overhead.md`.
 - Scripts: `scripts/sweep_criu_dump.py`, `timed_dump_experiment.py`, `job_energy.py`, `carbon_temporal.py`,
-  `carbon_temporal_forecast.py`, `cc_infer_bench.py`. Raw data: ford `data/*.jsonl` + local results_master/.
+  `carbon_temporal_forecast.py`, `carbon_temporal_15min.py`, `carbon_killzone.py`, `cc_infer_bench.py`.
+  Raw data: ford `data/*.jsonl` + local results_master/.
 - REMAINING: spatial migrate-leg analysis; optional idle-aware + threshold-policy carbon variants.
