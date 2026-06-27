@@ -121,4 +121,7 @@ WAN single-stream 8-25 s/GB (RTT-scaled), parallel ~0.5-1 s/GB. (network_coeffic
 - Scripts: `scripts/sweep_criu_dump.py`, `timed_dump_experiment.py`, `job_energy.py`, `carbon_temporal.py`,
   `carbon_temporal_forecast.py`, `carbon_temporal_15min.py`, `carbon_killzone.py`, `carbon_spatial.py`,
   `carbon_spatial_zones.py`, `cc_infer_bench.py`. Raw data: ford `data/*.jsonl` + local results_master/.
-- REMAINING: spatial migrate-leg analysis; optional idle-aware + threshold-policy carbon variants.
+- Decision rule: `mechanism_breakeven.md` (`mechanism_breakeven.py`) -- the capstone. Both legs reduce
+  to `shift iff f > N*r*`, r* = E_mech/E_compute (measured, CI-independent). Temporal r* 0.02-6.6%,
+  spatial r* 0.6-42%; r* predicts every measured kill. The mechanism cost as a scheduling decision input.
+- REMAINING: optional spatial latency/stall axis; idle-aware + threshold-policy carbon variants; paper writeup.
