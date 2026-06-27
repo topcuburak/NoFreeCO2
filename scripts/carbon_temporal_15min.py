@@ -6,18 +6,30 @@ hourly. Per the brief, we REINTERPRET each hourly CI sample as one 15-min slot (
 a 4-hour span is now 16 CI values. Keeping the workload COMPUTE hours unchanged, a job that needs C
 compute hours now needs 4C slots and a deadline of H hours is 4H slots.
 
-Two schedulers are compared, both relative to "run now" (naive, contiguous from t):
-  - NO suspend/resume : may delay the start for free, but must run the 4C slots CONTIGUOUSLY.
-                        -> picks the single cleanest contiguous 4C-slot window. Mechanism cost = 0.
-  - WITH suspend/resume: may also suspend mid-run to skip dirty slots -> picks the 4C cleanest slots
-                        anywhere in the window (may be scattered). Pays a measured dump+restore
-                        (split-priced: dump half at the suspend-slot CI, restore half at the
-                        resume-slot CI) for every internal gap.
+THREE baselines are compared, all carbon measured over the same job:
 
-The marginal value of suspend/resume is (savings_with - savings_without). When it is NEGATIVE the
-fragmentation gain does not pay for the mechanism, i.e. suspend/restore KILLS the saving and you are
-better off with the free contiguous shift. At 15-min granularity even C=1h jobs (4 slots) can fragment,
-so they are no longer automatically immune.
+  B1  NO temporal scheduling. Run now: the 4C slots contiguously from start t. This is the REFERENCE
+      everything else is saved against (its own savings is 0 by definition).
+
+  B2  IDEAL temporal scheduling, mechanism FREE. Place the 4C compute slots on the CLEANEST slots
+      anywhere in the [t, t+4H] window (carbon-optimal placement), and charge ZERO suspend/restore.
+      This is the theoretical upper bound on temporal savings.
+
+  B3  REAL temporal scheduling, mechanism CHARGED. Same cleanest-slot placement as B2, but pay a
+      MEASURED dump+restore for every internal gap, split-priced (dump half at the suspend-slot CI,
+      restore half at the resume-slot CI), separately for NVMe and SATA.
+
+Savings% are vs B1. Then per instance:
+  ideal  = 100*(B1 - B2_carbon)/B1                # B2 savings, no overhead (upper bound)
+  net    = 100*(B1 - B3_carbon)/B1                # B3 savings, after the mechanism
+  ovh    = ideal - net = 100*mechanism/B1         # carbon the suspend/restore eats (percentage points)
+  KILL   <=> net < 0                              # real temporal scheduling is WORSE than running now
+B2 >= B3 always (mechanism >= 0); but B3 can fall BELOW B1 (net < 0) when the mechanism exceeds the
+entire shifting benefit. At 15-min granularity even C=1h jobs (4 slots) can fragment, so they are no
+longer automatically immune. B2 is tier-independent; B3 and ovh/kill are reported per tier.
+
+DATA CLEANING: traces that are effectively CONSTANT (CV < 1%, e.g. hong_kong flat 360, indonesia flat
+580) are placeholder / non-physical CI and are DROPPED. CI values <= 0 are treated as missing (load_ci).
 
 Representative regions are auto-selected stratified by CI volatility (CV). For each region we draw N
 random start times per workload and average. Both NVMe and SATA tiers reported.
@@ -41,39 +53,43 @@ from carbon_temporal import WORKLOADS, load_ci, run_blocks
 SLOT_H = 0.25  # each CI sample now represents 15 min = 0.25 h
 
 
-def best_contiguous(win, cslots):
-    """Min sum over any contiguous cslots-length window (the free, no-suspend shift)."""
-    s = sum(win[:cslots])
-    best = s
-    for i in range(cslots, len(win)):
-        s += win[i] - win[i - cslots]
-        if s < best:
-            best = s
-    return best
+def place(win, cslots, rankby):
+    """Pick the cslots cleanest slots BY rankby (actual=oracle, predicted=forecast); cost on actual win.
 
-
-def eval15(win, cslots, P, dump_kwh, rest_kwh):
-    """win: list of CI for the H-slot window (no None). Returns the two schedules' carbon."""
-    e_slot = P * SLOT_H                                  # kWh delivered per 15-min slot
-    naive = sum(win[:cslots]) * e_slot                   # run now, contiguous from t
-
-    # NO suspend: best contiguous block (delayed start is free, run is one piece)
-    nosusp = best_contiguous(win, cslots) * e_slot
-
-    # WITH suspend: 4C cleanest slots anywhere, pay mechanism per internal gap
-    order = sorted(range(len(win)), key=lambda i: win[i])
+    Returns (compute_ci_sum, K, Sdump, Srest) all in raw gCO2/kWh-sum units (multiply by e_slot for
+    carbon). Sdump/Srest are the summed ACTUAL CI at the suspend/resume slot of every internal gap, so
+    the mechanism is priced per tier OUTSIDE: mech = dump_kwh*Sdump + rest_kwh*Srest.
+    """
+    order = sorted(range(len(win)), key=lambda i: rankby[i])
     sel = sorted(order[:cslots])
-    compute = sum(win[i] for i in sel) * e_slot
+    compute = sum(win[i] for i in sel)
     blocks = run_blocks(sel)
     K = len(blocks) - 1
-    mech = 0.0
-    for b in range(K):
-        ci_dump = win[blocks[b][1]]                      # suspend+store priced here
-        ci_rest = win[blocks[b + 1][0]]                  # load+resume priced here
-        mech += dump_kwh * ci_dump + rest_kwh * ci_rest
-    susp = compute + mech
+    Sdump = sum(win[blocks[b][1]] for b in range(K))     # actual CI at each suspend+store
+    Srest = sum(win[blocks[b + 1][0]] for b in range(K)) # actual CI at each load+resume
+    return compute, K, Sdump, Srest
 
-    return dict(naive=naive, nosusp=nosusp, susp=susp, compute=compute, mech=mech, K=K)
+
+def region_mape(cv_pct):
+    """Per-region forecast MAPE (fraction) from CI volatility, calibrated to MEASURED CarbonCast:
+    flat grids (FPL/PJM/PL) 3-5%, volatile (CISO/DE/BPAT/ES) 13-19%. Linear in CV, clamped 3-20%."""
+    return min(0.20, max(0.03, 0.0035 * cv_pct))
+
+
+PHI = 0.9   # AR(1) autocorrelation of forecast error: real forecasters err with a slow bias, not
+            # independent per-slot noise, so the predicted-cleanest slots stay CLUSTERED (CarbonCast
+            # smooths -> suspends less). White noise (phi=0) would shred autocorrelation and inflate K.
+
+
+def ar1_error(rng, n, sd, phi=PHI):
+    """Length-n AR(1) multiplicative-error series with marginal sd ~= sd (stationary start)."""
+    innov = sd * (1.0 - phi * phi) ** 0.5
+    e = [0.0] * n
+    prev = rng.gauss(0.0, sd)                      # stationary initial draw
+    for i in range(n):
+        prev = phi * prev + rng.gauss(0.0, innov)
+        e[i] = prev
+    return e
 
 
 def valid_starts(ci, hslots):
@@ -96,13 +112,22 @@ def main() -> None:
     rng = random.Random(args.seed)
 
     root = os.path.join(os.path.dirname(os.path.dirname(_HERE)), "carbon_data")
-    traces = {}
+    traces, dropped = {}, []
     for c in sorted(os.listdir(root)):
         hits = glob.glob(os.path.join(root, c, f"**/*_{args.year}_hourly.csv"), recursive=True)
         if hits:
-            ci = load_ci(hits[0])
-            if len(ci) >= 8000:
-                traces[c] = ci
+            ci = load_ci(hits[0])                       # CI<=0 -> None already
+            if len(ci) < 8000:
+                continue
+            nz = [v for v in ci if v]
+            if not nz:
+                dropped.append((c, "empty")); continue
+            cvv = 100 * st.pstdev(nz) / st.mean(nz)
+            if cvv < 1.0:                               # effectively constant -> placeholder, not real CI
+                dropped.append((c, f"constant CV={cvv:.1f}%")); continue
+            traces[c] = ci
+    if dropped:
+        print("[15min] dropped non-physical traces: " + ", ".join(f"{c} ({why})" for c, why in dropped))
 
     # volatility (CV%) per region, then stratified pick across the CV range
     cv = {c: 100 * st.pstdev([v for v in ci if v]) / st.mean([v for v in ci if v]) for c, ci in traces.items()}
@@ -114,58 +139,116 @@ def main() -> None:
           f"{args.samples} random starts each, slot=15min")
     print("  regions (CV%): " + ", ".join(f"{c}={cv[c]:.0f}" for c in regions))
 
+    sigma = {c: 1.25 * region_mape(cv[c]) for c in regions}   # gauss sd so E|err| ~= MAPE
+    TIERS = ("nvme", "sata")
+
     # horizons in HOURS: a tight (2xC) and a loose (4xC) slack, capped at 48 h
     rows = []
     for wl, w in WORKLOADS.items():
         C = w["C"]
         cslots = int(round(C / SLOT_H))
+        P = w["P"]
+        dk = {tier: w[f"dump_{tier}"] / 3600.0 for tier in TIERS}    # kJ -> kWh
+        rk = {tier: w[f"rest_{tier}"] / 3600.0 for tier in TIERS}
         for slack, Hh in (("tight", min(48, 2 * C)), ("loose", min(48, 4 * C))):
             hslots = int(round(Hh / SLOT_H))
             if hslots <= cslots:
                 continue
-            for tier in ("nvme", "sata"):
-                dump_kwh = w[f"dump_{tier}"] / 3600.0
-                rest_kwh = w[f"rest_{tier}"] / 3600.0
-                sv_no, sv_su, dlt, ovh, Ks, kill = [], [], [], [], [], []
-                for c in regions:
-                    ci = traces[c]
-                    starts = valid_starts(ci, hslots)
-                    if not starts:
-                        continue
-                    picks = starts if len(starts) <= args.samples else rng.sample(starts, args.samples)
-                    for t in picks:
-                        win = ci[t:t + hslots]
-                        r = eval15(win, cslots, w["P"], dump_kwh, rest_kwh)
-                        if r["naive"] <= 0:
-                            continue
-                        s_no = 100 * (r["naive"] - r["nosusp"]) / r["naive"]
-                        s_su = 100 * (r["naive"] - r["susp"]) / r["naive"]
-                        gross = r["naive"] - r["compute"]
-                        sv_no.append(s_no)
-                        sv_su.append(s_su)
-                        dlt.append(s_su - s_no)
-                        ovh.append(100 * r["mech"] / gross if gross > 0 else 0.0)
-                        Ks.append(r["K"])
-                        kill.append(1 if (s_su - s_no) < -1e-9 else 0)
-                if not sv_no:
+            ideal = []                                              # B2 oracle free-shift savings%
+            Ko, Kf = [], []                                         # K oracle / forecast
+            mis_kill = []                                           # MISPREDICTION-ONLY kill (mech free), tier-indep
+            # per mode (oracle 'o' / forecast 'f') per tier: savings list + kill loss list
+            net = {m: {t: [] for t in TIERS} for m in "of"}
+            ovh = {m: {t: [] for t in TIERS} for m in "of"}
+            klist = {m: {t: [] for t in TIERS} for m in "of"}       # net of KILLED instances only
+            for c in regions:
+                ci = traces[c]
+                sd = sigma[c]
+                starts = valid_starts(ci, hslots)
+                if not starts:
                     continue
-                rows.append(dict(wl=wl, name=w["name"], tier=tier, C=C, slack=slack, H=Hh,
-                                 nosusp=st.mean(sv_no), susp=st.mean(sv_su), delta=st.mean(dlt),
-                                 ovh=st.mean(ovh), K=st.mean(Ks), kill=100 * st.mean(kill), n=len(sv_no)))
+                picks = starts if len(starts) <= args.samples else rng.sample(starts, args.samples)
+                for t in picks:
+                    win = ci[t:t + hslots]
+                    e = P * SLOT_H
+                    naive = sum(win[:cslots]) * e
+                    if naive <= 0:
+                        continue
+                    err = ar1_error(rng, hslots, sd)                                # autocorrelated
+                    pred = [max(1.0, v * (1.0 + err[i])) for i, v in enumerate(win)] # forecast CI
+                    co, ko, sdmp_o, srst_o = place(win, cslots, win)                 # oracle: rank by actual
+                    cf, kf, sdmp_f, srst_f = place(win, cslots, pred)                # forecast: rank by predicted
+                    ideal.append(100 * (naive - co * e) / naive)
+                    Ko.append(ko); Kf.append(kf)
+                    misfree = 100 * (naive - cf * e) / naive        # forecast placement, mechanism FREE
+                    mis_kill.append(1 if misfree < -1e-9 else 0)    # only misprediction can flip this
+                    for (m, comp, sdmp, srst) in (("o", co, sdmp_o, srst_o), ("f", cf, sdmp_f, srst_f)):
+                        for tier in TIERS:
+                            mech = dk[tier] * sdmp + rk[tier] * srst
+                            n = 100 * (naive - comp * e - mech) / naive
+                            net[m][tier].append(n)
+                            ovh[m][tier].append(100 * mech / naive)
+                            if n < -1e-9:
+                                klist[m][tier].append(n)
+            if not ideal:
+                continue
+            row = dict(wl=wl, name=w["name"], C=C, slack=slack, H=Hh,
+                       ideal=st.mean(ideal), Ko=st.mean(Ko), Kf=st.mean(Kf),
+                       kill_mis=100 * st.mean(mis_kill), n=len(ideal))
+            for m in "of":
+                for tier in TIERS:
+                    row[f"net_{m}_{tier}"] = st.mean(net[m][tier])
+                    row[f"ovh_{m}_{tier}"] = st.mean(ovh[m][tier])
+                    nn = len(net[m][tier]); kk = klist[m][tier]
+                    row[f"kill_{m}_{tier}"] = 100 * len(kk) / nn if nn else 0.0
+                    row[f"closs_{m}_{tier}"] = st.mean(kk) if kk else 0.0      # conditional mean loss
+            rows.append(row)
 
-    # print: one row per wl/slack/tier
-    print(f"\nCOMPUTE C unchanged; slots = 4*C (15-min). save% vs run-now. delta = value of suspend.")
-    print(f"{'WL':3} {'C':>2}h {'slack':5} {'H':>3}h {'tier':4} | {'no-susp%':>8} {'susp-net%':>9} "
-          f"{'Δsusp%':>7} {'mech%ovh':>8} {'K':>5} {'kill%':>6}")
-    for wl in ["A4", "A5", "A7", "A8", "A2", "A1", "A6", "A3"]:
-        for slack in ("tight", "loose"):
-            for tier in ("nvme", "sata"):
-                r = next((x for x in rows if x["wl"] == wl and x["slack"] == slack and x["tier"] == tier), None)
+    def table(mode, title):
+        tag = "oracle" if mode == "o" else "forecast"
+        kcol = "Ko" if mode == "o" else "Kf"
+        print(f"\n=== {title} ===")
+        print(f"save% vs B1 (run-now).  B2 ideal = oracle free-shift (upper bound).  B3 = shift + "
+              f"measured suspend/restore ({tag} placement).")
+        print(f"ovh=B2-B3 (pp).  kill%=B3<0 freq.  cml=conditional mean loss (avg net | killed).")
+        print(f"{'WL':3} {'C':>2}h {'slack':5} {'H':>3}h | {'B2idl%':>7} || "
+              f"{'nvB3%':>6} {'ovh':>4} {'kil%':>5} {'cml':>5} || "
+              f"{'saB3%':>6} {'ovh':>4} {'kil%':>5} {'cml':>5} | {'K':>4}")
+        for wl in ["A4", "A5", "A7", "A8", "A2", "A1", "A6", "A3"]:
+            for slack in ("tight", "loose"):
+                r = next((x for x in rows if x["wl"] == wl and x["slack"] == slack), None)
                 if not r:
                     continue
-                print(f"{wl:3} {r['C']:>2}  {slack:5} {r['H']:>3}  {tier:4} | "
-                      f"{r['nosusp']:8.1f} {r['susp']:9.1f} {r['delta']:7.2f} {r['ovh']:8.1f} "
-                      f"{r['K']:5.2f} {r['kill']:6.1f}")
+                print(f"{wl:3} {r['C']:>2}  {slack:5} {r['H']:>3}  | {r['ideal']:7.1f} || "
+                      f"{r[f'net_{mode}_nvme']:6.1f} {r[f'ovh_{mode}_nvme']:4.2f} "
+                      f"{r[f'kill_{mode}_nvme']:5.1f} {r[f'closs_{mode}_nvme']:5.1f} || "
+                      f"{r[f'net_{mode}_sata']:6.1f} {r[f'ovh_{mode}_sata']:4.2f} "
+                      f"{r[f'kill_{mode}_sata']:5.1f} {r[f'closs_{mode}_sata']:5.1f} | {r[kcol]:4.2f}")
+
+    table("o", "ORACLE (perfect foresight)")
+    table("f", "FORECAST (CarbonCast-calibrated misprediction, decide-on-predicted / pay-on-actual)")
+
+    # KILL DECOMPOSITION: separate the two flippers.
+    #   mech-only  = oracle placement + real mechanism  (perfect foresight; only the mechanism flips it)
+    #   mis-only   = forecast placement + FREE mechanism (no mechanism; only misprediction flips it)
+    #   combined   = forecast placement + real mechanism
+    print(f"\n=== KILL DECOMPOSITION: mechanism vs misprediction (kill% = B3<0 frequency) ===")
+    print(f"mis-only is tier-independent (mechanism set free).  dom = larger single flipper per tier.")
+    print(f"{'WL':3} {'C':>2}h {'slack':5} | {'mis-only':>8} || {'nv mech':>7} {'nv comb':>7} {'nv dom':>7} "
+          f"|| {'sa mech':>7} {'sa comb':>7} {'sa dom':>7}")
+    for wl in ["A4", "A5", "A7", "A8", "A2", "A1", "A6", "A3"]:
+        for slack in ("tight", "loose"):
+            r = next((x for x in rows if x["wl"] == wl and x["slack"] == slack), None)
+            if not r:
+                continue
+            mis = r["kill_mis"]
+            cells = ""
+            for tier in TIERS:
+                mech = r[f"kill_o_{tier}"]
+                comb = r[f"kill_f_{tier}"]
+                dom = "MECH" if mech > mis else "mispred"
+                cells += f" {mech:7.1f} {comb:7.1f} {dom:>7} ||"
+            print(f"{wl:3} {r['C']:>2}  {slack:5} | {mis:8.1f} ||{cells}".rstrip(" |"))
 
     if args.out:
         with open(args.out, "w", newline="") as f:

@@ -1,103 +1,85 @@
-# Sub-hourly (15-min) temporal scheduling: when suspend/restore stops being worth it
+# Sub-hourly (15-min) temporal scheduling: three baselines, real misprediction, kill decomposition
 
-`scripts/carbon_temporal_15min.py`. Same deadline-budget model as `carbon_temporal.py`, but the
-scheduler now decides every **15 minutes** instead of hourly. Per the brief we REINTERPRET each
-hourly CI sample as one 15-min slot (no interpolation), so a 4-hour span is now 16 CI values. The
-workload COMPUTE hours are unchanged, so a job needing C compute hours now needs **4C slots** and a
-deadline of H hours is **4H slots**.
+`scripts/carbon_temporal_15min.py`. Temporal deadline-budget scheduling at **15-minute** granularity.
+Each hourly Electricity Maps `direct` CI sample is REINTERPRETED as one 15-min slot (no interpolation),
+so a job needing C compute hours needs **4C slots** and a deadline of H hours is **4H slots**. Monte
+Carlo over 18 CV-stratified regions x 80 random start windows, both NVMe and SATA tiers, 2023.
 
-Two schedulers, both measured against "run now" (naive contiguous block from start hour t):
-- **NO suspend/resume** -- may delay the start for free, but must run the 4C slots CONTIGUOUSLY.
-  Picks the single cleanest contiguous 4C-slot window. Mechanism cost = 0.
-- **WITH suspend/resume** -- may also suspend mid-run to skip dirty slots, so it picks the 4C
-  cleanest slots anywhere in the window (possibly scattered). Pays a MEASURED dump+restore per
-  internal gap, split-priced (dump half at the suspend-slot CI, restore half at the resume-slot CI),
-  NVMe and SATA.
+**Data cleaning:** grids that are effectively constant (CV < 1%: hong_kong flat 360, indonesia flat
+580) are non-physical placeholders and are DROPPED (45 grids kept). CI <= 0 treated as missing.
 
-The headline metric is **Δsusp = savings_with - savings_without**: the marginal carbon value of being
-allowed to suspend. **Δsusp < 0 means suspend/restore KILLS the saving** -- the fragmentation gain
-does not pay for the mechanism and you are better off with the free contiguous shift. `kill%` is the
-fraction of (region x start) instances with Δsusp < 0.
+## Three baselines (carbon over the whole job, savings % vs B1)
+- **B1 run-now** -- 4C slots contiguously from t. Reference (0% by definition).
+- **B2 ideal** -- place the 4C compute slots on the cleanest slots anywhere in the window, mechanism
+  FREE. Theoretical upper bound on temporal savings. Tier-independent.
+- **B3 real** -- same cleanest-slot placement, paying the MEASURED dump+restore per internal gap,
+  split-priced (dump half at the suspend-slot CI, restore half at the resume-slot CI), per tier.
 
-**Setup**: 18 representative regions auto-selected stratified by CI volatility (CV 0%..104%:
-hong_kong, south_africa, israel, taiwan, turkey, czechia, cyprus, italy, peru, brazil, greece, spain,
-great_britain, chile, austria, lithuania, finland, sweden), 80 random start times per region per
-workload, Electricity Maps 2023 `direct` CI. Two slacks per workload: tight (H=2C) and loose (H=4C).
+`ovh = B2 - B3` (carbon the mechanism eats, pp). `kill% = B3 < 0` frequency (real temporal scheduling
+emits MORE than running now). `cml` = conditional mean loss (avg net over killed instances only) --
+separates frequent-but-harmless from rare-but-damaging kills. At 15-min granularity even C=1h jobs
+(4 slots) can fragment, so the hourly "short jobs are immune" result no longer holds.
 
-## Result (mean over 18 regions x 80 starts)
-save% is vs run-now. Δsusp = value of suspend. mech%ovh = mechanism as % of the scattered gross.
-| WL | C | slack | H | tier | no-susp % | susp-net % | **Δsusp %** | mech %ovh | K | **kill %** |
+## Misprediction (forecast) layer -- decide on predicted, pay on actual
+A real scheduler uses a forecast. We add per-region forecast error calibrated to the MEASURED
+CarbonCast MAPE (flat grids 3-5%, volatile 13-19%; mapped `mape = clamp(0.0035*CV, 3%, 20%)`). The
+error is **autocorrelated (AR(1), phi=0.9)** -- real forecasters err with a slow bias, not independent
+per-slot noise, so the predicted-cleanest slots stay clustered (matching the measured "CarbonCast
+suspends less"). White noise (phi=0) was rejected: it shredded the autocorrelation and inflated K
+2-3x. The scheduler picks slots by PREDICTED CI; carbon and mechanism are paid on ACTUAL CI.
+
+## Result (mean over 18 regions x 80 starts; tight slack H=2C, loose H=4C)
+ORACLE (perfect foresight):
+| WL | C | slack | B2 idl% | nv B3% | nv ovh | nv kill% | sa B3% | sa ovh | sa kill% | K |
 |---|---|---|---|---|---|---|---|---|---|---|
-| A4 DLRM | 1h | tight | 2h | nvme | 6.1 | 6.6 | **+0.50** | 28 | 0.40 | 14 |
-| A4 DLRM | 1h | tight | 2h | sata | 6.4 | 5.8 | **-0.62** | 255 | 0.42 | 32 |
-| A4 DLRM | 1h | loose | 4h | nvme | 13.9 | 14.7 | +0.73 | 116 | 0.47 | 12 |
-| A4 DLRM | 1h | loose | 4h | sata | 13.9 | 13.3 | **-0.60** | 144 | 0.52 | 36 |
-| A5 graph | 1h | tight | 2h | nvme | 6.4 | 6.5 | +0.07 | 100 | 0.40 | 24 |
-| A5 graph | 1h | tight | 2h | sata | 6.7 | 4.8 | **-1.89** | 908 | 0.40 | 33 |
-| A5 graph | 1h | loose | 4h | sata | 14.2 | 12.2 | **-1.94** | 245 | 0.47 | 36 |
-| A7 DuckDB-MP | 1h | tight | 2h | nvme | 6.3 | 5.7 | **-0.59** | 457 | 0.40 | 30 |
-| A7 DuckDB-MP | 1h | tight | 2h | sata | 5.9 | 4.0 | **-1.93** | 503 | 0.41 | 35 |
-| A7 DuckDB-MP | 1h | loose | 4h | sata | 14.7 | 12.7 | **-2.00** | 287 | 0.48 | 37 |
-| A8 DuckDB-MT | 1h | tight | 2h | nvme | 6.6 | 6.1 | **-0.50** | 346 | 0.40 | 31 |
-| A8 DuckDB-MT | 1h | tight | 2h | sata | 6.0 | 3.1 | **-2.97** | 1200 | 0.43 | 36 |
-| A8 DuckDB-MT | 1h | loose | 4h | sata | 13.8 | 10.7 | **-3.05** | 416 | 0.49 | 39 |
-| A2 vLLM | 2h | tight | 4h | nvme | 8.6 | 10.1 | +1.46 | 17 | 0.78 | 9 |
-| A2 vLLM | 2h | tight | 4h | sata | 8.9 | 9.9 | +1.01 | 195 | 0.79 | 29 |
-| A2 vLLM | 2h | loose | 8h | nvme | 17.0 | 19.0 | +2.01 | 5 | 1.05 | 7 |
-| A2 vLLM | 2h | loose | 8h | sata | 17.0 | 18.2 | +1.29 | 37 | 1.05 | 33 |
-| A1 FSDP | 4h | tight | 8h | nvme | 8.1 | 12.9 | +4.73 | 9 | 1.62 | 9 |
-| A1 FSDP | 4h | tight | 8h | sata | 7.9 | 11.1 | +3.18 | 55 | 1.63 | 38 |
-| A1 FSDP | 4h | loose | 16h | nvme | 13.4 | 21.2 | **+7.82** | 5 | 2.35 | 3 |
-| A1 FSDP | 4h | loose | 16h | sata | 13.3 | 18.7 | +5.41 | 70 | 2.34 | 27 |
-| A6 gem5 | 8h | tight | 16h | nvme | 7.3 | 13.0 | +5.76 | 21 | 3.13 | 9 |
-| A6 gem5 | 8h | tight | 16h | sata | 8.0 | 10.5 | +2.50 | 88 | 3.17 | **46** |
-| A6 gem5 | 8h | loose | 32h | nvme | 13.7 | 21.9 | +8.22 | 14 | 4.73 | 7 |
-| A6 gem5 | 8h | loose | 32h | sata | 14.5 | 18.5 | +3.93 | 66 | 4.64 | 43 |
-| A3 ViT | 12h | tight | 24h | nvme | 7.2 | 15.5 | +8.33 | 1.5 | 4.52 | 0.1 |
-| A3 ViT | 12h | tight | 24h | sata | 6.9 | 14.8 | +7.92 | 11 | 4.52 | 3 |
-| A3 ViT | 12h | loose | 48h | nvme | 13.1 | 24.4 | **+11.33** | 1.0 | 6.76 | 0.3 |
-| A3 ViT | 12h | loose | 48h | sata | 13.5 | 24.3 | +10.79 | 8 | 6.81 | 2 |
+| A4 | 1 | tight | 7.4 | 7.2 | 0.20 | 8.3 | 5.8 | 1.56 | 24.6 | 0.50 |
+| A7 | 1 | tight | 7.1 | 5.7 | 1.41 | 22.6 | 4.1 | 2.98 | 30.5 | 0.46 |
+| A8 | 1 | tight | 7.4 | 6.1 | 1.24 | 20.7 | 3.4 | 4.00 | 32.6 | 0.47 |
+| A2 | 2 | tight | 10.9 | 10.8 | 0.12 | 3.2 | 10.1 | 0.82 | 12.7 | 0.86 |
+| A1 | 4 | loose | 22.6 | 22.2 | 0.36 | 0.6 | 19.9 | 2.64 | 8.4 | 2.58 |
+| A6 | 8 | tight | 15.0 | 13.8 | 1.16 | 5.5 | 10.0 | 5.02 | 27.3 | 3.55 |
+| A3 | 12 | loose | 25.9 | 25.8 | 0.12 | 0.0 | 24.9 | 1.01 | 0.2 | 7.44 |
 
-## Findings
-1. **Sub-hourly granularity removes the C=1h "immunity".** At hourly granularity short jobs fit one
-   hour, K=0, and NEVER suspend (immune, see `carbon_temporal.md`). At 15-min granularity a C=1h job
-   is 4 slots, so the cleanest 4 slots can scatter (K~0.4) and it now pays mechanism cost. The four
-   short workloads (A4/A5/A7/A8) flip to **Δsusp < 0 on SATA** -- suspend/resume LOSES vs just doing
-   the free contiguous shift, **roughly 1 in 3 times (kill 32-39%)**.
-2. **Storage tier is the decision variable.** On NVMe the mechanism is cheap, so finer granularity is
-   almost always a win (Δsusp > 0 for every workload except a few short-job/tight cases near zero;
-   kill <= 14%). On SATA the same fine-grained schedule is a net loss for short jobs and only
-   marginally positive for the mid jobs, while still leaving long jobs exposed (A6 gem5 SATA
-   **kills 43-46%** of the time). The fixed dump/restore energy, amortized over a 15-min run block
-   instead of a 60-min one, is ~4x more impactful.
-3. **mech%ovh routinely exceeds 100% for short jobs on SATA** (up to 1200% for A8) -- the dump/restore
-   energy is several times larger than the entire extra carbon the scattered schedule saves. That is
-   the quantitative definition of the kill zone: the mechanism is bigger than the prize.
-4. **Long jobs still benefit, and more than at hourly granularity, but only on NVMe.** A3 ViT gains
-   **+11.3%** absolute carbon from sub-hourly suspend (NVMe, loose) and A1/A6 gain +8%. They have many
-   compute slots to redistribute, so the fragmentation prize dwarfs a cheap NVMe mechanism. On SATA the
-   same jobs keep most of the prize for A3 (overhead small relative to its large gross) but A6 gem5
-   (low 148 W power) loses much of it and is killed ~45% of the time.
-5. **K rises with granularity** (hourly K was 0.3-1.3; here 0.4 for short jobs up to 6.8 for A3
-   loose), because 15-min slots de-correlate faster, so the cleanest set fragments into more blocks --
-   each an extra dump+restore.
+FORECAST (CarbonCast-calibrated misprediction) -- same columns, K is forecast K:
+| WL | C | slack | B2 idl% | nv B3% | nv kill% | sa B3% | sa kill% | K |
+|---|---|---|---|---|---|---|---|---|
+| A4 | 1 | tight | 7.4 | 5.7 | 25.7 | 3.9 | 38.6 | 0.65 |
+| A8 | 1 | tight | 7.4 | 4.2 | 37.6 | 0.4 | 47.6 | 0.65 |
+| A6 | 8 | tight | 15.0 | 11.0 | 17.8 | 6.3 | 43.3 | 4.24 |
+| A3 | 12 | loose | 25.9 | 21.7 | 4.1 | 20.6 | 9.0 | 8.95 |
+(full 32-row tables in `results/carbon_temporal_15min_2023.csv`.)
 
-## Takeaway for the paper
-Going sub-hourly is not free. It unlocks a larger carbon prize (long jobs on NVMe gain up to +11%
-absolute over the free contiguous shift), but it also **manufactures suspends for jobs that had none**,
-and on SATA the measured dump/restore energy is large enough that fine-grained suspend/restore is a
-**net carbon LOSS for short jobs (~1/3 of the time) and for low-power long jobs like gem5 (~45%)**.
-The free contiguous-shift baseline is the safe default; suspend/restore should only be enabled when
-the tier is fast (NVMe) and the job is long. This is exactly the mechanism-cost decision boundary the
-measured (E_mech, P) make quantifiable. Output: `results/carbon_temporal_15min_2023.csv` (32 rows).
+## Kill decomposition -- mechanism vs misprediction (the characteristic effect)
+`mis-only` = forecast placement + FREE mechanism (only misprediction can flip it). `mech-only` =
+oracle placement + real mechanism (only the mechanism can flip it). Combined = forecast + mechanism.
+| WL | C | mis-only | nv mech-only | sa mech-only | dominant (sata) |
+|---|---|---|---|---|---|
+| A4 | 1 | 19.7 | 8.3 | 24.6 | mechanism |
+| A5 | 1 | 21.4 | 16.5 | 32.3 | mechanism |
+| A7 | 1 | 22.1 | 22.6 | 30.5 | mechanism |
+| A8 | 1 | 21.0 | 20.7 | 32.6 | mechanism |
+| A2 | 2 | 16.5 | 3.2 | 12.7 | mispred |
+| A1 | 4 | 10.1 | 2.0 | 16.5 | mechanism |
+| A6 | 8 | 7.7 | 5.5 | 27.3 | **mechanism** |
+| A3 | 12 | 5.3 | 0.1 | 2.2 | mispred |
+
+**Two structurally distinct failure modes, set by the job not the policy:**
+1. **Short jobs are misprediction-bound.** Tiny prize (B2 ~7%), so one forecast slip wipes it: mis-only
+   alone flips 16-22% of cases, independent of storage. Mechanism is secondary and only co-dominant on SATA.
+2. **Low-power long jobs are mechanism-bound.** A6 gem5 has a big prize (15-24%) but 148 W power and
+   K~3.5-5, so the SATA mechanism alone flips 27% of cases (3.5x misprediction's 7.7%).
+3. **Storage tier is the switch.** NVMe nearly removes the mechanism -> misprediction is the only real
+   flipper everywhere. SATA makes the mechanism dominant for short and low-power-long jobs. Robust
+   corner: long high-power job (A1/A3) on NVMe -- every flipper in single digits.
+
+## Takeaway
+Sub-hourly removes the C=1h immunity (short jobs now fragment, K~0.4). The mechanism is negligible on
+NVMe (ovh < 1.5 pp) and decisive on SATA (short-job kills 38-48% under forecast, low-power A6 43%).
+Whether suspend/restore is worth it depends on (storage tier, job length, power, forecast quality),
+which the measured (E_mech, P) make quantifiable.
 
 ## Caveats
-- **Relabel, not interpolate (deliberate, and the aggressive case for mechanism cost).** We reinterpret
-  each hourly value as a 15-min slot rather than interpolating, per the brief. Adjacent slots therefore
-  differ by a full hour of real diurnal change, which OVERSTATES sub-hourly volatility and so OVERSTATES
-  the temptation to fragment. This makes the run a stress test / upper bound on suspend frequency (and
-  thus on mechanism cost). True 15-min CI would be smoother, fewer suspends, smaller kill%. A
-  piecewise-linear interpolation variant is a one-line change (interp the 4 sub-slots between hourly
-  endpoints) and would soften every kill% number.
-- Oracle foresight (the scattered schedule sees all 4H future slots), suspend-and-free accounting (idle
-  power during suspend not charged), and research-grounded compute hours C -- same as `carbon_temporal.md`.
+- Relabel (hourly->15-min) overstates sub-hourly volatility and so overstates fragmentation/kill -- an
+  upper bound; true 15-min CI would be smoother. Deliberate (per brief), stress-test posture.
+- Oracle foresight for B2; suspend-and-free accounting (idle power during suspend not charged --
+  justified: an idle interval powers the node down); C research-grounded (`workload_durations_refs.md`).

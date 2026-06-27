@@ -114,8 +114,11 @@ WAN single-stream 8-25 s/GB (RTT-scaled), parallel ~0.5-1 s/GB. (network_coeffic
   (SUB-HOURLY 15-min: no-suspend free-shift vs with-suspend, 18 regions x 80 starts -- short jobs lose
   immunity, SATA kills ~1/3 of short jobs and ~45% of A6), `carbon_forecast.md` (CarbonCast real
   predictor), `ci_forecasting_refs.md` (forecasters survey + sources).
-- Spatial (pending): `network_coefficients_lit.md`, `wan_migration_overhead.md`.
+- Spatial (DONE): `carbon_spatial.md` (migrate = suspend/resume + e_net*S; global oracle ~92% prize,
+  M~1, kill~0; zone-limited + outlier-trimmed kill zone -- crossover: kill when in-zone prize < fixed
+  migrate overhead; EAST_ASIA short/large-state net-negative 60-71%), `network_coefficients_lit.md`,
+  `wan_migration_overhead.md`.
 - Scripts: `scripts/sweep_criu_dump.py`, `timed_dump_experiment.py`, `job_energy.py`, `carbon_temporal.py`,
-  `carbon_temporal_forecast.py`, `carbon_temporal_15min.py`, `carbon_killzone.py`, `cc_infer_bench.py`.
-  Raw data: ford `data/*.jsonl` + local results_master/.
+  `carbon_temporal_forecast.py`, `carbon_temporal_15min.py`, `carbon_killzone.py`, `carbon_spatial.py`,
+  `carbon_spatial_zones.py`, `cc_infer_bench.py`. Raw data: ford `data/*.jsonl` + local results_master/.
 - REMAINING: spatial migrate-leg analysis; optional idle-aware + threshold-policy carbon variants.
