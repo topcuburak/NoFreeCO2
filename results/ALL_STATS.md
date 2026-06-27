@@ -124,4 +124,8 @@ WAN single-stream 8-25 s/GB (RTT-scaled), parallel ~0.5-1 s/GB. (network_coeffic
 - Decision rule: `mechanism_breakeven.md` (`mechanism_breakeven.py`) -- the capstone. Both legs reduce
   to `shift iff f > N*r*`, r* = E_mech/E_compute (measured, CI-independent). Temporal r* 0.02-6.6%,
   spatial r* 0.6-42%; r* predicts every measured kill. The mechanism cost as a scheduling decision input.
+- Per-job profile: `mechanism_profile.md` (`mechanism_profile.py`) -- adds the LATENCY axis l*=T_mech/
+  runtime (measured) alongside carbon r*. Two-objective per-job decision (net carbon = f-N*r*; added
+  latency = N*l**runtime <= slack). Axes uncorrelated (A1 carbon-cheap/latency-expensive vs A6 opposite;
+  A7/A8 spatial stall 55-57% of runtime) -> each job scheduled individually, no flat policy.
 - REMAINING: optional spatial latency/stall axis; idle-aware + threshold-policy carbon variants; paper writeup.
