@@ -28,10 +28,21 @@ _REPO = os.path.dirname(_HERE)
 sys.path.insert(0, _HERE)
 sys.path.insert(0, _REPO)
 
-from harness import measure_operation                       # noqa: E402
+from harness import measure_operation                     # noqa: E402
+from harness.configload import load                        # noqa: E402
 from _common import build_telemetry, write_record, print_record  # noqa: E402
 
-DRAM_W_PER_GB = 0.3
+DRAM_W_PER_GB = 0.3        # fallback only; real value from config power_model.dram.w_per_gb
+
+
+def tier_for(store_out, cfg):
+    """Reverse-lookup the storage-tier NAME whose configured path contains store_out.
+    Cross-server: tier names/paths come from the ACTIVE machine's config.storage.tiers,
+    never hardcoded, so the same script decomposes ford / H100 / any box from its yaml."""
+    for name, path in (cfg.get("storage", {}).get("tiers", {}) or {}).items():
+        if store_out.rstrip("/").startswith(str(path).rstrip("/")):
+            return name
+    return None
 
 
 def _resolve_criu(override=None):
@@ -164,6 +175,9 @@ def main() -> None:
     ap.add_argument("--store-out", default="/var/data", help="criu image dir TIER (not /tmp)")
     ap.add_argument("--baseline", type=float, default=5.0)
     ap.add_argument("--tag", default="s2_criu_nvme")
+    ap.add_argument("--config", default="ford.yaml",
+                    help="machine config in config/ (power_model + storage.tiers). Cross-server: "
+                         "point at h100.yaml etc. on other boxes; NO hardware numbers are hardcoded.")
     ap.add_argument("--criu-bin", default=None)
     ap.add_argument("--target", default="work_dram.py",
                     help="target script in scripts/: work_dram.py (ACTIVE compute, default) or "
@@ -186,7 +200,17 @@ def main() -> None:
     if os.geteuid() != 0:
         raise SystemExit("[s2] run as root (sudo -E) -- criu needs CAP_SYS_ADMIN + RAPL")
     criu = _resolve_criu(args.criu_bin)
-    drive_w = 3.0 if "home" in args.store_out else 50.0
+    cfg = load(args.config)
+    pm = cfg.get("power_model", {}) or {}
+    machine = cfg.get("machine", os.path.splitext(os.path.basename(args.config))[0])
+    tier = tier_for(args.store_out, cfg)
+    drive_tier = (pm.get("drive", {}) or {}).get(tier)
+    dram_wpg = (pm.get("dram", {}) or {}).get("w_per_gb", DRAM_W_PER_GB)
+    if not drive_tier:                                     # config miss -> flat fallback, LOUDLY (never silently wrong)
+        flat = 3.0 if "home" in args.store_out else 50.0
+        drive_tier = {"write_w": flat, "read_w": flat, "idle_w": 0.0}
+        print(f"[s2] WARN: no power_model.drive[{tier!r}] in {args.config} for store_out={args.store_out}; "
+              f"FALLBACK flat {flat} W both directions")
     target_py = os.path.join(_REPO, "scripts", args.target)
     pat = args.pat or args.target
     # require the target's comm so we never match the python driver / sudo / criu (which all carry
@@ -194,22 +218,28 @@ def main() -> None:
     # else derive from a --launch binary's basename (15-char kernel limit).
     want_comm = args.comm or (os.path.basename(shlex.split(args.launch)[0])[:15] if args.launch else None)
     sizes = [float(s) for s in args.sizes.split(",") if s.strip()]
-    print(f"[s2] criu={criu} target={args.target} drive_w={drive_w} store_out={args.store_out} sizes={sizes}")
+    print(f"[s2] criu={criu} target={args.target} store_out={args.store_out} sizes={sizes}")
+    print(f"[s2] machine={machine} tier={tier} drive={drive_tier} dram={dram_wpg} W/GB "
+          f"(config={args.config}, {pm.get('accounting', 'absolute')})")
 
-    tele = build_telemetry(nvml_gpus=[])                     # CPU domain: exclude GPU
+    tele = build_telemetry(cfg=cfg, nvml_gpus=[])            # CPU domain: exclude GPU (same cfg as power_model)
     tele.start()
 
     def emit(rec, phase, gb, c, img_bytes=None, rss_bytes=None):
-        dram = DRAM_W_PER_GB * gb * rec.latency_s
-        drive = drive_w * rec.latency_s
+        lat = rec.latency_s
+        pdrive = drive_tier["write_w"] if phase == "dump" else drive_tier["read_w"]   # dump=write, restore=read
+        dram = dram_wpg * gb * lat                           # absolute DRAM hold (access energy negligible)
+        drive = pdrive * lat                                 # absolute: full active power x latency
         meas = sum(s.energy_abs_j or 0.0 for s in rec.sources if s.name == "cpu_pkg_energy_rapl")
         rec.extra.update(mark_min=c, measured_abs_j=round(meas, 1), dram_model_j=round(dram, 1),
                          drive_model_j=round(drive, 1), full_total_j=round(meas + dram + drive, 1),
-                         footprint_gb=gb, image_bytes=img_bytes, rss_bytes=rss_bytes)
+                         footprint_gb=gb, image_bytes=img_bytes, rss_bytes=rss_bytes,
+                         # datasheet params used, for reproducibility + cross-server re-decompose
+                         pm_machine=machine, pm_tier=tier, pm_drive_w=pdrive, pm_dram_w_per_gb=dram_wpg)
         rec.config.update(tag=args.tag, phase=phase, workload="s2_criu")
         print_record(rec)
-        print(f"  modeled DRAM {dram:.0f} + drive {drive:.0f} | FULL (CPU+DRAM+drive): {meas+dram+drive:.0f} J",
-              flush=True)
+        print(f"  [{tier}/{'write' if phase == 'dump' else 'read'} {pdrive:.2f}W] modeled DRAM {dram:.0f} + "
+              f"drive {drive:.0f} | FULL (CPU+DRAM+drive): {meas + dram + drive:.0f} J", flush=True)
         write_record(rec, "timed_dump")
 
     try:

@@ -1,0 +1,72 @@
+# H100 rental box configuration — TEMPLATE.
+# !! EVERY FIELD MARKED "VERIFY" MUST BE CONFIRMED ON THE ACTUAL RENTED MACHINE !!
+# Purpose: the cross-generation trend (A100 -> H100), which requires the H100 numbers to be
+# METHODOLOGICALLY COMPARABLE to ford. See the PRE-RENTAL BLOCKERS at the bottom.
+
+machine: h100
+
+gpus:
+  count: 1                      # VERIFY (1x H100 is enough for the trend; the grid subset is single-GPU)
+  model: "NVIDIA H100 SXM5 80GB"   # VERIFY — SXM vs PCIe changes NVLink/PCIe bandwidth materially
+  pcie: "Gen5 x16"              # VERIFY (PCIe H100 = Gen5 x16; SXM = NVLink4)
+  nvlink: "NVLink4 ~900 GB/s"   # VERIFY (irrelevant if single-GPU)
+  hbm_gb: 80                    # H100 = HBM3, ~3.35 TB/s (A100 = HBM2e ~2.0 TB/s) -> the trend's key parameter
+
+cpu:
+  model: "VERIFY"               # CRITICAL: Intel vs AMD changes the RAPL DRAM domain (see telemetry)
+  sockets: 1                    # VERIFY
+  cores: 0                      # VERIFY
+  threads: 0                    # VERIFY
+  numa_nodes: 1                 # VERIFY
+  cores_per_numa: 0             # VERIFY
+
+gpu_numa_map: { 0: 0 }          # VERIFY with `nvidia-smi topo -m` / `lstopo`
+
+storage:
+  scratch: "/mnt/scratch"       # VERIFY
+  seq_write_gbps: 0.0           # VERIFY — measure with the storage microbench before the grid
+  seq_read_gbps: 0.0            # VERIFY
+  tiers:
+    # !! Most rented GPU boxes are NVMe-ONLY. If there is no second (slow) tier, the TIER AXIS
+    # !! IS UNAVAILABLE on H100. That is acceptable: the trend compares the SAME config
+    # !! (direct + NVMe) across generations. Do NOT fabricate a SATA point.
+    nvme: "/mnt/scratch"        # VERIFY
+    # sas_ssd: <likely absent>
+
+telemetry:
+  power_sample_hz: 20           # must match ford (>=10 Hz) for comparability
+  baseline_seconds: 30          # must match ford
+  pin_gpu_clock_mhz: 1980       # VERIFY H100 clock + VERIFY the provider ALLOWS `nvidia-smi -lgc`
+  sources:
+    nvml:        true           # VERIFY pynvml/nvidia-ml-py present (pynvml is DEPRECATED -> pin nvidia-ml-py)
+    rapl:        true           # VERIFY /sys/class/powercap/intel-rapl readable AND we have root
+    perf_pkg:    false          # fallback if RAPL denied
+    ipmi:        false          # almost certainly unavailable in a rental
+    nvme_smart:  true           # VERIFY /sys/block/*/stat readable
+  dram_rapl: false              # !! IF THE HOST IS INTEL, a DRAM RAPL domain EXISTS -> could be `true`.
+                                # !! ford (AMD EPYC) has NO DRAM domain and MODELS DRAM at 0.3 W/GB.
+                                # !! For a like-for-like trend, KEEP DRAM MODELED on both. Changing the
+                                # !! DRAM methodology between generations would confound the comparison.
+
+# Datasheet-grounded aux-power model (same schema as ford.yaml). ABSOLUTE accounting.
+# !! FILL FROM THE RENTED BOX: NVMe datasheet active read/write + `nvme id-ctrl` PS0 mp;
+# !! DRAM w_per_gb from the DIMM datasheet (idle W / capacity); CPU floor = measured RAPL idle.
+# Drive keys MUST match storage.tiers names above. Most rentals are NVMe-only -> no sas tier.
+power_model:
+  accounting: absolute
+  cpu_floor_w: 0                 # VERIFY: measured RAPL idle-hold on the rented host
+  dram:
+    w_per_gb: 0.05               # VERIFY: rented box DIMM datasheet (idle W / GB). Keep MODELED like ford.
+  drive:
+    nvme: { write_w: 0.0, read_w: 0.0, idle_w: 0.0 }   # VERIFY: rented NVMe datasheet + nvme id-ctrl PS0 mp
+
+# ---------------------------------------------------------------------------
+# PRE-RENTAL BLOCKERS — confirm with the provider BEFORE paying:
+#   1. ROOT access            -> required to read RAPL (/sys/class/powercap). No root = no CPU energy.
+#   2. `nvidia-smi -lgc`      -> required to pin clocks. Many providers block this. No pinning =
+#                                the GPU downclocks during dump = numbers not comparable to ford.
+#   3. NVMe scratch           -> required for the dump target.
+#   4. Bare metal, not vGPU   -> vGPU/MIG virtualization distorts NVML power attribution.
+# If 1 or 2 are denied, the H100 numbers are NOT methodologically comparable to ford and the
+# cross-generation trend CANNOT be claimed from measurement -> fall back to dirty-rates (Step 6b).
+# ---------------------------------------------------------------------------

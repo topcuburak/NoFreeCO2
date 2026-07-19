@@ -1,6 +1,8 @@
 # ford testbed configuration (as of 2026-05-28). Used by the harness for
 # pinning, NUMA placement, and which telemetry sources to expect.
 
+machine: ford
+
 gpus:
   count: 4
   model: "NVIDIA A100 SXM4 40GB"
@@ -38,3 +40,16 @@ telemetry:
     ipmi:        false           # chassis power -- ipmitool not installed; enable if added
     nvme_smart:  true            # NVMe bytes written via /sys/block/*/stat (no nvme-cli)
   dram_rapl: false               # AMD EPYC: no DRAM domain -> DRAM energy is modeled
+
+# Datasheet-grounded power model for aux-energy decomposition (ABSOLUTE accounting:
+# full active power x latency, idle included). CPU energy itself is MEASURED (RAPL);
+# these drive/DRAM terms are MODELED from manufacturer datasheets, cross-checked vs
+# each device's own reported ceiling. Drive keys MUST match storage.tiers names.
+power_model:
+  accounting: absolute
+  cpu_floor_w: 130               # RAPL idle-hold floor (also measured live per-op); reference only
+  dram:
+    w_per_gb: 0.05               # 6x 128GB Samsung M386AAG40BM3 LRDIMM DDR4-3200; band 0.03-0.08; access negligible
+  drive:                         # per-tier active power (W), by direction: dump=write, restore=read
+    nvme_raid0: { write_w: 40.0, read_w: 40.0, idle_w: 17.0 }   # 2x Samsung PM1733 3.84TB Gen4 (datasheet 20W/drive; nvme id-ctrl PS0 mp=25W ceiling)
+    sas_ssd:    { write_w: 3.36, read_w: 3.06, idle_w: 1.27 }   # HPE VK000480GXNZA SATA (datasheet seq write/read, idle)
