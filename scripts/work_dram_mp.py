@@ -31,12 +31,26 @@ def set_comm(name=COMM):
         pass
 
 
-def churn(gb, seconds, nthreads):
-    """Allocate gb GiB float64, keep it resident + dirty for `seconds` using nthreads."""
+def churn(gb, seconds, nthreads, mode="hot"):
+    """Allocate gb GiB float64 resident, and run nthreads threads for `seconds`.
+    mode=hot : threads continuously increment their slice (dirty+active, worst-case freeze).
+    mode=idle: threads sleep (array stays resident+held but NOT churned) -> isolates the
+               cost of criu freezing IDLE vs ACTIVELY-RUNNING threads at checkpoint."""
     import numpy as np
     n = max(1, int(gb * (1024 ** 3) // 8))
-    arr = np.ones(n, dtype=np.float64)                    # resident from the start
+    arr = np.ones(n, dtype=np.float64)                    # resident from the start (held below)
     deadline = time.time() + seconds
+    if mode == "idle":                                    # threads exist but block -> fast to freeze
+        def sleeper():
+            while time.time() < deadline:
+                time.sleep(0.5)
+        ts = [threading.Thread(target=sleeper, daemon=True) for _ in range(max(1, nthreads))]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        assert arr[0] >= 1.0                              # keep arr referenced (resident) to the end
+        return
     if nthreads <= 1:
         while time.time() < deadline:
             arr += 1.0                                    # full read+write pass
@@ -58,6 +72,8 @@ def main():
     ap.add_argument("--gb", type=float, default=8.0, help="TOTAL GiB across all processes")
     ap.add_argument("--procs", type=int, default=1, help="number of processes (fork tree)")
     ap.add_argument("--threads", type=int, default=1, help="threads per process")
+    ap.add_argument("--thread-mode", default="hot", choices=["hot", "idle"],
+                    help="hot=threads churn (dirty+active); idle=threads sleep (resident, blocked)")
     ap.add_argument("--seconds", type=int, default=100000)
     a = ap.parse_args()
     per = a.gb / a.procs                                   # per-process footprint
@@ -65,11 +81,11 @@ def main():
     for _ in range(a.procs - 1):                          # fork procs-1 children; parent is the procs-th
         if os.fork() == 0:
             set_comm()
-            churn(per, a.seconds, a.threads)
+            churn(per, a.seconds, a.threads, a.thread_mode)
             os._exit(0)
-    print(f"[wdmp] PID={os.getpid()} procs={a.procs} threads={a.threads} "
+    print(f"[wdmp] PID={os.getpid()} procs={a.procs} threads={a.threads} mode={a.thread_mode} "
           f"total={a.gb:.1f}GiB per_proc={per:.2f}GiB", flush=True)
-    churn(per, a.seconds, a.threads)                      # parent holds its own share too
+    churn(per, a.seconds, a.threads, a.thread_mode)       # parent holds its own share too
 
 
 if __name__ == "__main__":
