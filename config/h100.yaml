@@ -6,10 +6,12 @@
 machine: h100
 
 gpus:
-  count: 1                      # VERIFY (1x H100 is enough for the trend; the grid subset is single-GPU)
+  count: 2                      # VERIFY. Budget cap = 2x H100. nGPU axis on H100 is {1,2}: the 1-4
+                                # linearity of P = floor + p_board*nGPU is established on ford (A100);
+                                # H100 only needs the SLOPE (p_board) verified via the 1->2 step.
   model: "NVIDIA H100 SXM5 80GB"   # VERIFY — SXM vs PCIe changes NVLink/PCIe bandwidth materially
   pcie: "Gen5 x16"              # VERIFY (PCIe H100 = Gen5 x16; SXM = NVLink4)
-  nvlink: "NVLink4 ~900 GB/s"   # VERIFY (irrelevant if single-GPU)
+  nvlink: "NVLink4 ~900 GB/s"   # VERIFY (irrelevant for independent hold_gpu processes)
   hbm_gb: 80                    # H100 = HBM3, ~3.35 TB/s (A100 = HBM2e ~2.0 TB/s) -> the trend's key parameter
 
 cpu:
