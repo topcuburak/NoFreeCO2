@@ -83,6 +83,24 @@ done
 # RESULT,mode,dir,GB,seconds,GBps,cpu_J  -> direct-vs-staged measured, incl. CPU energy
 ```
 
+## Phase 4.5 — DRAM-model validation byproduct (Intel host only, ~10 min, FREE win)
+
+ford (AMD EPYC) has no DRAM RAPL domain, so DRAM is MODELED at 0.03-0.08 W/GB. If this box
+is Intel (h100_facts.txt lists a `dram` domain), MEASURE it: hold N GiB resident and read
+the dram-domain counter. Validates the band -> one MODELED label becomes measured.
+
+```bash
+DRAM_DOM=$(grep -l dram /sys/class/powercap/intel-rapl:*:*/name 2>/dev/null | head -1 | xargs dirname)
+if [ -n "$DRAM_DOM" ]; then
+  for GB in 16 64 128; do
+    python scripts/work_dram_mp.py --gb $GB --procs 1 --threads 1 --seconds 70 & W=$!
+    sleep 5; E0=$(cat $DRAM_DOM/energy_uj); sleep 60; E1=$(cat $DRAM_DOM/energy_uj)
+    echo "DRAM ${GB}GiB: $(( (E1-E0)/60 )) uW avg" | tee -a ~/logs/dram_validate.log
+    wait $W
+  done
+else echo "no dram RAPL domain on this box"; fi
+```
+
 ## Phase 5 — optional workload anchor (~1-2 h; skip if budget tight)
 
 One real GPU workload validates the model on H100 beyond synthetics. Cheapest: ViT-style
@@ -101,6 +119,7 @@ sudo nvidia-smi -rgc     # unpin clocks (courtesy)
 ```
 
 ## Afterwards (local, no billing)
+
 1. Fill `config/h100.yaml` from `h100_facts.txt` + SKU datasheet (power_model, clocks, storage).
 2. `decompose_mech_energy.py --records data/incoming/h100_records.jsonl --config h100.yaml`.
 3. Transfer validation: predict H100 legs from the A100-fit structure + H100 datasheet
