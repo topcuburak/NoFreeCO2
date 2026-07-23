@@ -119,9 +119,10 @@ def simulate(args):
     rng = random.Random(args.seed)
     arrive_every = max(1, round(args.arrive_every_h / dt_h))
 
-    # capacity: steady-state running jobs ~ sum(C_h)/arrive_every_h; K = ceil(that / U)
-    steady = sum(w["C_h"] for w in wls.values()) / (args.arrive_every_h * len(wls))
-    K = math.inf if not args.utilization else max(1, math.ceil(steady * len(wls) / args.utilization))
+    # capacity: mean concurrency = arrival_rate x mean duration (Little's law);
+    # K = ceil(concurrency / U) slots. U=0.9 -> ~10% headroom, the green-rush regime.
+    concurrency = (1.0 / args.arrive_every_h) * (sum(w["C_h"] for w in wls.values()) / len(wls))
+    K = math.inf if not args.utilization else max(1, math.ceil(concurrency / args.utilization))
 
     jobs, active = [], []
     for t in range(len(ci)):
@@ -149,15 +150,22 @@ def simulate(args):
                 if gain > args.theta:
                     if args.policy == "ca_costblind":
                         want_run = False
-                    else:                        # ca_costaware: N1 predictor in the loop
-                        E_rest = j.wl["P_w"] * j.slots_left * dt_h * 3600.0
-                        benefit_g = (view.now(t) - best_ahead) * E_rest / 3.6e6
-                        pause_j = min(j.wl["park_w"] * dt_h * 3600.0, j.wl["Emech_j"])
+                    else:                        # ca_costaware: MARGINAL condition (the a* rule):
+                        # benefit of deferring THIS slot of work to the cheapest ahead slot
+                        E_slot = j.wl["P_w"] * dt_h * 3600.0
+                        benefit_g = (view.now(t) - best_ahead) * E_slot / 3.6e6
+                        # marginal cost: what pausing now will actually bill (park or pair)
+                        exp_gap_h = max(dt_h, (slack_slots * dt_h) / 2)
+                        pause_j = (j.wl["park_w"] * dt_h * 3600.0
+                                   if j.wl["park_w"] * exp_gap_h * 3600.0 < j.wl["Emech_j"]
+                                   else (j.wl["Emech_j"] if j.state == RUN else 0.0))
                         cost_g = pause_j * view.now(t) / 3.6e6
                         want_run = benefit_g <= cost_g
-            # capacity gate: RUN/PARK need a slot, SUSP does not
-            if want_run and j not in occupied and len(occupied) >= K:
-                want_run = False                 # blocked by capacity (the green rush)
+            # capacity gate: RUN/PARK need a slot, SUSP does not. Deadline-forced runs
+            # bypass the gate (emergency overflow) so jobs always finish; the congestion
+            # cost shows up as blocked DISCRETIONARY shifts (the green rush).
+            if want_run and not must_run and j not in occupied and len(occupied) >= K:
+                want_run = False
             # apply transition + billing
             if want_run and j.state != RUN:
                 j.state = RUN; j.transitions += 1   # resume: pair cost billed at dump time
