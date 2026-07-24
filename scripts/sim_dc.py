@@ -88,6 +88,7 @@ def load_artifact(args):
     lat = pd.read_csv(os.path.join(art, "shared_data", "gcp_latency_matrix.csv"),
                       index_col="origin")
     lat = lat.loc[:, ~lat.columns.duplicated()]
+    lat = lat[~lat.index.duplicated()]
     common = [z for z in lat.columns if z in cdf.columns and z in lat.index]
     if args.zones == "spatial34":
         zones = common
@@ -175,7 +176,7 @@ def simulate(args):
     if args.trace:
         rows = load_trace(args.trace, args.trace_limit)
         arrivals = {z: [] for z in zones}
-        for i, (ah, wname, wl) in enumerate(sorted(rows)):
+        for i, (ah, wname, wl) in enumerate(sorted(rows, key=lambda r: r[0])):
             t = round(ah / dt_h)
             if t + round(wl["C_h"] / dt_h) + horizon + 4 < T:
                 arrivals[zones[i % len(zones)]].append((t, wname, wl))   # RR zone placement
